@@ -25,10 +25,23 @@ export class FakeExtension {
   readonly received: { type: string; payload: unknown }[] = [];
   ws!: WebSocket;
 
-  constructor(public handlers: Record<string, Handler> = {}) {}
+  constructor(
+    public handlers: Record<string, Handler> = {},
+    /** Capabilities announced in `hello`, like the companion extension; none = original extension. */
+    private readonly capabilities?: string[],
+  ) {}
 
   connect(port: number, origin: string | undefined = EXTENSION_ORIGIN): Promise<this> {
     this.ws = new WebSocket(`ws://localhost:${port}`, origin ? { origin } : {});
+    this.ws.on("open", () => {
+      if (!this.capabilities) return;
+      this.ws.send(
+        JSON.stringify({
+          type: "hello",
+          payload: { name: "browsermcp-companion", version: "test", capabilities: this.capabilities },
+        }),
+      );
+    });
     this.ws.on("message", async (data) => {
       const { id, type, payload } = JSON.parse(data.toString());
       this.received.push({ type, payload });

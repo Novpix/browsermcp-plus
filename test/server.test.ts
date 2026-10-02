@@ -62,6 +62,13 @@ describe("MCP server", () => {
         "browser_type",
         "browser_wait",
         "browser_wait_for",
+        "browser_file_upload",
+        "browser_evaluate",
+        "browser_scroll",
+        "browser_tab_list",
+        "browser_tab_new",
+        "browser_tab_select",
+        "browser_tab_close",
       ].sort(),
     );
     for (const tool of tools) {

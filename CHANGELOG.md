@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Open-source companion extension (`extension/`), wire compatible with the
+  published one, with trusted CDP input, an accessibility snapshot with stable
+  refs, and extra capabilities announced through a `hello` handshake.
+- Tools that need the companion extension: `browser_file_upload` (file inputs
+  and file-chooser buttons), `browser_evaluate`, `browser_scroll`,
+  `browser_tab_list`, `browser_tab_new`, `browser_tab_select`,
+  `browser_tab_close`. With the published extension they fail fast with an
+  explanation instead of timing out.
+- End-to-end test suite running the extension in Chromium (`npm run test:e2e`).
+
 ## 0.2.0
 
 The server no longer depends on the private monorepo it was extracted from and

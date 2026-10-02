@@ -6,7 +6,7 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
-  EXTENSION_ORIGIN,
+  DEFAULT_ALLOWED_ORIGINS,
   NO_CONNECTION_MESSAGE,
   TAKEOVER_ACK_CODE,
   TAKEOVER_HEADER,
@@ -54,7 +54,7 @@ export class ExtensionBridge {
 
   constructor(options: BridgeOptions) {
     this.options = {
-      allowedOrigins: [EXTENSION_ORIGIN],
+      allowedOrigins: DEFAULT_ALLOWED_ORIGINS,
       takeover: true,
       killExisting: false,
       standbyRetryMs: 2_000,

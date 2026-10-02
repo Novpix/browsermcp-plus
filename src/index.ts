@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Command, InvalidArgumentError } from "commander";
 
 import packageJSON from "../package.json";
-import { DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_WS_PORT, EXTENSION_ORIGIN } from "./config";
+import { DEFAULT_ALLOWED_ORIGINS, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_WS_PORT } from "./config";
 import { log, setVerbose } from "./log";
 import { createServer } from "./server";
 
@@ -29,7 +29,7 @@ const program = new Command()
   )
   .option(
     "--allow-origin <origin...>",
-    `additional origins allowed to connect as the extension (always allowed: ${EXTENSION_ORIGIN})`,
+    `additional origins allowed to connect as the extension (always allowed: ${DEFAULT_ALLOWED_ORIGINS.join(", ")})`,
     [],
   )
   .option("--no-takeover", "do not ask an already running server to hand over the port")
@@ -72,7 +72,7 @@ async function main() {
   const server = await createServer({
     version: packageJSON.version,
     port: options.port,
-    allowedOrigins: [EXTENSION_ORIGIN, ...options.allowOrigin],
+    allowedOrigins: [...DEFAULT_ALLOWED_ORIGINS, ...options.allowOrigin],
     takeover: options.takeover,
     killExisting: options.killExisting,
     requestTimeoutMs: options.requestTimeout,

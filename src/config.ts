@@ -17,6 +17,15 @@ export const DEFAULT_WS_PORT = 9009;
 export const EXTENSION_ID = "bjfgambnhccakkhmkepdoekmckoijdlc";
 export const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 
+/**
+ * The open-source companion extension in `extension/`. It speaks the same
+ * protocol plus extra messages (file upload, evaluate, tabs, scroll).
+ */
+export const COMPANION_EXTENSION_ID = "kjcoeimgiimkjbeeblldadmlebheajgb";
+export const COMPANION_ORIGIN = `chrome-extension://${COMPANION_EXTENSION_ID}`;
+
+export const DEFAULT_ALLOWED_ORIGINS = [EXTENSION_ORIGIN, COMPANION_ORIGIN];
+
 /** Error string the extension returns when no tab has been connected. */
 export const EXTENSION_NO_TAB_ERROR = "No tab is connected";
 

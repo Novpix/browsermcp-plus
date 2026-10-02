@@ -1,3 +1,4 @@
+import { evaluate, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./companion";
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
 import { getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
@@ -19,4 +20,12 @@ export const tools: Tool[] = [
   waitFor,
   getConsoleLogs,
   screenshot,
+  // Companion extension only.
+  uploadFile,
+  evaluate,
+  scroll,
+  tabList,
+  tabNew,
+  tabSelect,
+  tabClose,
 ];

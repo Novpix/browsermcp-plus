@@ -46,7 +46,59 @@ export type ExtensionMessages = {
     payload: Record<string, never>;
     result: unknown[];
   };
+
+  // Companion extension only (announced through `hello` capabilities).
+  browser_upload_file: { payload: ElementRef & { paths: string[] }; result: unknown };
+  browser_evaluate: {
+    payload: { function: string; ref?: string; element?: string };
+    result: EvaluateResult;
+  };
+  browser_scroll: {
+    payload: { ref?: string; element?: string; deltaX?: number; deltaY?: number };
+    result: unknown;
+  };
+  browser_tab_list: { payload: Record<string, never>; result: TabInfo[] };
+  browser_tab_new: { payload: { url?: string }; result: TabInfo };
+  browser_tab_select: { payload: { tabId: number }; result: TabInfo };
+  browser_tab_close: { payload: { tabId?: number }; result: TabInfo | null };
 };
+
+export type TabInfo = {
+  id: number;
+  windowId: number;
+  title: string;
+  url: string;
+  active: boolean;
+  connected: boolean;
+};
+
+export type EvaluateResult = {
+  type: string;
+  value?: unknown;
+  unserializableValue?: string;
+  description?: string;
+};
+
+/** Messages only the companion extension understands. */
+export const COMPANION_MESSAGES = new Set<MessageType>([
+  "browser_upload_file",
+  "browser_evaluate",
+  "browser_scroll",
+  "browser_tab_list",
+  "browser_tab_new",
+  "browser_tab_select",
+  "browser_tab_close",
+]);
+
+/** Sent by the companion extension right after connecting. */
+export type ExtensionInfo = {
+  name: string;
+  version: string;
+  capabilities: string[];
+};
+
+/** How long to wait for a `hello` before assuming the original extension. */
+const HELLO_WAIT_MS = 1_000;
 
 export type MessageType = keyof ExtensionMessages;
 export type Payload<T extends MessageType> = ExtensionMessages[T]["payload"];
@@ -71,11 +123,29 @@ export class ExtensionConnection {
   private readonly pending = new Map<string, Pending>();
   private nextId = 0;
   private closed = false;
+  private _info: ExtensionInfo | undefined;
+  private announce!: () => void;
+
+  /** Resolves once the extension has introduced itself, or after a short grace period. */
+  readonly ready: Promise<void>;
 
   constructor(readonly ws: WebSocket) {
+    this.ready = new Promise((resolve) => {
+      this.announce = resolve;
+      setTimeout(resolve, HELLO_WAIT_MS).unref();
+    });
     ws.on("message", (data) => this.onMessage(data));
     ws.on("close", () => this.onClose());
     ws.on("error", () => this.onClose());
+  }
+
+  /** Present when the companion extension is connected. */
+  get info(): ExtensionInfo | undefined {
+    return this._info;
+  }
+
+  supports(type: MessageType): boolean {
+    return !COMPANION_MESSAGES.has(type) || !!this._info?.capabilities.includes(type);
   }
 
   get isOpen(): boolean {
@@ -131,6 +201,11 @@ export class ExtensionConnection {
     } catch {
       return;
     }
+    if (isHello(message)) {
+      this._info = message.payload;
+      this.announce();
+      return;
+    }
     if (!isResponse(message)) return;
     const { requestId, result, error } = message.payload;
     this.settle(requestId, { result, error });
@@ -173,6 +248,18 @@ function isResponse(message: unknown): message is {
     typeof payload === "object" &&
     payload !== null &&
     typeof (payload as { requestId?: unknown }).requestId === "string"
+  );
+}
+
+function isHello(message: unknown): message is { type: "hello"; payload: ExtensionInfo } {
+  if (typeof message !== "object" || message === null) return false;
+  const { type, payload } = message as { type?: unknown; payload?: Partial<ExtensionInfo> };
+  return (
+    type === "hello" &&
+    typeof payload === "object" &&
+    payload !== null &&
+    typeof payload.name === "string" &&
+    Array.isArray(payload.capabilities)
   );
 }
 

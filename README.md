@@ -59,6 +59,21 @@ Browser MCP is an MCP server + Chrome extension that allows you to automate your
 
 Tools carry MCP annotations so clients can skip confirmation for read-only tools.
 
+### Companion extension
+
+The open-source [companion extension](extension/) speaks the same protocol and
+unlocks extra tools that the published extension cannot support:
+
+| Tool | Description |
+| --- | --- |
+| `browser_file_upload` | Upload local files via a file input or the button that opens the file chooser |
+| `browser_evaluate` | Run JavaScript in the page, optionally on a snapshot element |
+| `browser_scroll` | Scroll by pixels or scroll an element into view |
+| `browser_tab_list` / `_new` / `_select` / `_close` | Tab management |
+
+With the published extension these tools return an error explaining that they
+need the companion extension.
+
 ## Options
 
 ```
@@ -95,6 +110,7 @@ exits. If the port is held by something that does not cooperate (for example a
 ```sh
 npm install
 npm run check     # typecheck + tests + build
+npm run test:e2e  # real Chromium + companion extension (needs a Playwright Chromium)
 npm run inspector # try the server in the MCP Inspector
 ```
 
