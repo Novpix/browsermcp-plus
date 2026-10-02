@@ -4,14 +4,37 @@ import { WebSocket } from "ws";
 
 import { EXTENSION_ORIGIN } from "../src/config";
 
+/**
+ * A port that is free on both IPv4 and IPv6: clients connect to `localhost`,
+ * which may resolve to either family.
+ */
 export async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    // The dual-stack wildcard covers 0.0.0.0 and :: at once; fall back to IPv4.
+    const port = (await ephemeralPort("::")) || (await ephemeralPort("0.0.0.0"));
+    if (port && (await isFree(port, "127.0.0.1")) && (await isFree(port, "::1"))) return port;
+  }
+  throw new Error("Could not find a free port");
+}
+
+function ephemeralPort(host: string): Promise<number> {
+  return new Promise((resolve) => {
     const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.once("error", () => resolve(0));
+    server.listen(0, host, () => {
       const { port } = server.address() as net.AddressInfo;
       server.close(() => resolve(port));
     });
+  });
+}
+
+function isFree(port: number, host: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", (error: NodeJS.ErrnoException) =>
+      resolve(error.code === "EADDRNOTAVAIL" || error.code === "EAFNOSUPPORT"),
+    );
+    server.listen(port, host, () => server.close(() => resolve(true)));
   });
 }
 
