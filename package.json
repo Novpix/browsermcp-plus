@@ -1,10 +1,15 @@
 {
   "name": "@browsermcp/mcp",
-  "version": "0.1.3",
-  "description": "MCP server for browser automation using Browser MCP",
+  "version": "0.2.0",
+  "description": "MCP server for browser automation using the Browser MCP extension",
   "author": "Browser MCP",
+  "license": "Apache-2.0",
   "homepage": "https://browsermcp.io",
   "bugs": "https://github.com/browsermcp/mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrowserMCP/mcp.git"
+  },
   "type": "module",
   "bin": {
     "mcp-server-browsermcp": "dist/index.js"
@@ -12,29 +17,30 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
+    "build": "tsup",
+    "watch": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "build": "tsup src/index.ts --format esm && shx chmod +x dist/*.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test && npm run build",
     "prepare": "npm run build",
-    "watch": "tsup src/index.ts --format esm --watch ",
-    "inspector": "CLIENT_PORT=9001 SERVER_PORT=9002 pnpx @modelcontextprotocol/inspector node dist/index.js"
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "commander": "^13.1.0",
-    "ws": "^8.18.1",
-    "zod": "^3.24.2",
-    "zod-to-json-schema": "^3.24.3"
+    "ws": "^8.22.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@r2r/messaging": "workspace:*",
-    "@repo/config": "workspace:*",
-    "@repo/messaging": "workspace:*",
-    "@repo/types": "workspace:*",
-    "@repo/utils": "workspace:*",
-    "@types/ws": "^8.18.0",
-    "shx": "^0.3.4",
-    "tsup": "^8.4.0",
-    "typescript": "^5.6.2"
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
   }
 }

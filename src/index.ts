@@ -1,66 +1,106 @@
 #!/usr/bin/env node
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { program } from "commander";
-
-import { appConfig } from "@repo/config/app.config";
-
-import type { Resource } from "@/resources/resource";
-import { createServerWithTools } from "@/server";
-import * as common from "@/tools/common";
-import * as custom from "@/tools/custom";
-import * as snapshot from "@/tools/snapshot";
-import type { Tool } from "@/tools/tool";
+import { Command, InvalidArgumentError } from "commander";
 
 import packageJSON from "../package.json";
+import { DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_WS_PORT, EXTENSION_ORIGIN } from "./config";
+import { log, setVerbose } from "./log";
+import { createServer } from "./server";
 
-function setupExitWatchdog(server: Server) {
-  process.stdin.on("close", async () => {
-    setTimeout(() => process.exit(0), 15000);
-    await server.close();
-    process.exit(0);
-  });
+function integer(min: number) {
+  return (value: string) => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < min) {
+      throw new InvalidArgumentError(`Expected an integer >= ${min}.`);
+    }
+    return parsed;
+  };
 }
 
-const commonTools: Tool[] = [common.pressKey, common.wait];
+const program = new Command()
+  .name("mcp-server-browsermcp")
+  .description("MCP server that automates your browser through the Browser MCP extension")
+  .version(packageJSON.version)
+  .option(
+    "--port <number>",
+    "WebSocket port the extension connects to (the published extension always uses 9009)",
+    integer(1),
+    DEFAULT_WS_PORT,
+  )
+  .option(
+    "--allow-origin <origin...>",
+    `additional origins allowed to connect as the extension (always allowed: ${EXTENSION_ORIGIN})`,
+    [],
+  )
+  .option("--no-takeover", "do not ask an already running server to hand over the port")
+  .option(
+    "--kill-existing",
+    "terminate whatever listens on the port if it does not hand it over (pre-0.2 behaviour)",
+    false,
+  )
+  .option(
+    "--request-timeout <ms>",
+    "timeout for a single browser action",
+    integer(1),
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  )
+  .option(
+    "--snapshot-max-chars <n>",
+    "truncate page snapshots longer than this (0 = never)",
+    integer(0),
+    0,
+  )
+  .option("--no-action-snapshots", "do not append a page snapshot to action results")
+  .option("--verbose", "log debug output to stderr", false);
 
-const customTools: Tool[] = [custom.getConsoleLogs, custom.screenshot];
+type CliOptions = {
+  port: number;
+  allowOrigin: string[];
+  takeover: boolean;
+  killExisting: boolean;
+  requestTimeout: number;
+  snapshotMaxChars: number;
+  actionSnapshots: boolean;
+  verbose: boolean;
+};
 
-const snapshotTools: Tool[] = [
-  common.navigate(true),
-  common.goBack(true),
-  common.goForward(true),
-  snapshot.snapshot,
-  snapshot.click,
-  snapshot.hover,
-  snapshot.type,
-  snapshot.selectOption,
-  ...commonTools,
-  ...customTools,
-];
+async function main() {
+  program.parse();
+  const options = program.opts<CliOptions>();
+  setVerbose(options.verbose);
 
-const resources: Resource[] = [];
-
-async function createServer(): Promise<Server> {
-  return createServerWithTools({
-    name: appConfig.name,
+  const server = await createServer({
     version: packageJSON.version,
-    tools: snapshotTools,
-    resources,
+    port: options.port,
+    allowedOrigins: [EXTENSION_ORIGIN, ...options.allowOrigin],
+    takeover: options.takeover,
+    killExisting: options.killExisting,
+    requestTimeoutMs: options.requestTimeout,
+    snapshotMaxChars: options.snapshotMaxChars,
+    actionSnapshots: options.actionSnapshots,
   });
+
+  let shuttingDown = false;
+  const shutdown = async (reason: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.debug(`Shutting down (${reason})`);
+    setTimeout(() => process.exit(0), 5_000).unref();
+    try {
+      await server.close();
+    } finally {
+      process.exit(0);
+    }
+  };
+
+  process.stdin.on("close", () => void shutdown("stdin closed"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  await server.mcp.connect(new StdioServerTransport());
 }
 
-/**
- * Note: Tools must be defined *before* calling `createServer` because only declarations are hoisted, not the initializations
- */
-program
-  .version("Version " + packageJSON.version)
-  .name(packageJSON.name)
-  .action(async () => {
-    const server = await createServer();
-    setupExitWatchdog(server);
-
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-  });
-program.parse(process.argv);
+main().catch((error) => {
+  log.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});

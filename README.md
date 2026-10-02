@@ -7,7 +7,7 @@
 <p align="center">
   Automate your browser with AI.
   <br />
-  <a href="https://browsermcp.io"><strong>Website</strong></a> 
+  <a href="https://browsermcp.io"><strong>Website</strong></a>
   •
   <a href="https://docs.browsermcp.io"><strong>Docs</strong></a>
 </p>
@@ -16,17 +16,90 @@
 
 Browser MCP is an MCP server + Chrome extension that allows you to automate your browser using AI applications like VS Code, Claude, Cursor, and Windsurf.
 
-## Features
+- ⚡ Fast: automation happens locally on your machine, without network latency.
+- 🔒 Private: your browser activity stays on your device.
+- 👤 Logged in: uses your existing browser profile and sessions.
+- 🥷🏼 Stealth: uses your real browser fingerprint, avoiding basic bot detection.
 
-- ⚡ Fast: Automation happens locally on your machine, resulting in better performance without network latency.
-- 🔒 Private: Since automation happens locally, your browser activity stays on your device and isn't sent to remote servers.
-- 👤 Logged In: Uses your existing browser profile, keeping you logged into all your services.
-- 🥷🏼 Stealth: Avoids basic bot detection and CAPTCHAs by using your real browser fingerprint.
+## Setup
 
-## Contributing
+1. Install the [Browser MCP extension](https://chromewebstore.google.com/detail/browser-mcp-automate-your/bjfgambnhccakkhmkepdoekmckoijdlc).
+2. Add the server to your MCP client:
 
-This repo contains all the core MCP code for Browser MCP, but currently cannot yet be built on its own due to dependencies on utils and types from the monorepo where it's developed.
+   ```json
+   {
+     "mcpServers": {
+       "browsermcp": {
+         "command": "npx",
+         "args": ["@browsermcp/mcp@latest"]
+       }
+     }
+   }
+   ```
+
+3. Click the extension icon on the tab you want to automate and press **Connect**.
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `browser_navigate` | Open a URL (`example.com` → `https://example.com`) |
+| `browser_go_back` / `browser_go_forward` | History navigation |
+| `browser_reload` | Reload the current page |
+| `browser_snapshot` | Accessibility snapshot with element refs |
+| `browser_click` / `browser_hover` | Act on an element from the snapshot |
+| `browser_type` | Type into an element, optionally pressing Enter |
+| `browser_select_option` | Choose dropdown values |
+| `browser_drag` | Drag one element onto another |
+| `browser_press_key` | Press a key (`Enter`, `Escape`, `PageDown`, …) |
+| `browser_wait` | Wait a number of seconds |
+| `browser_wait_for` | Wait until text appears or disappears |
+| `browser_get_console_logs` | Read the page console |
+| `browser_screenshot` | PNG of the visible viewport |
+
+Tools carry MCP annotations so clients can skip confirmation for read-only tools.
+
+## Options
+
+```
+--port <number>            WebSocket port (the published extension always uses 9009)
+--allow-origin <origin...> extra origins allowed to connect as the extension
+--no-takeover              don't ask a running server to hand over the port
+--kill-existing            terminate a non-cooperating process on the port
+--request-timeout <ms>     timeout for a single browser action (default 30000)
+--snapshot-max-chars <n>   truncate large snapshots (0 = never, default)
+--no-action-snapshots      don't append a snapshot to action results
+--verbose                  debug logging on stderr
+```
+
+## Multiple MCP clients
+
+Only one server can talk to the extension at a time. When a second client starts
+the server, the new instance asks the running one to hand over the port. The
+older instance switches to standby and takes over again once the newer one
+exits. If the port is held by something that does not cooperate (for example a
+0.1.x server), the server still starts and its tools explain the problem; pass
+`--kill-existing` to terminate that process instead.
+
+## Security model
+
+- The WebSocket endpoint listens on loopback only.
+- Connections are accepted only from the extension's origin
+  (`chrome-extension://bjfgambnhccakkhmkepdoekmckoijdlc`), so web pages you
+  visit cannot connect to the server and impersonate the extension.
+- Local processes running as your user are trusted, as with any local MCP server.
+- Page content returned by the tools is untrusted input for the model.
+
+## Development
+
+```sh
+npm install
+npm run check     # typecheck + tests + build
+npm run inspector # try the server in the MCP Inspector
+```
+
+The extension's wire protocol is documented in [`src/protocol.ts`](src/protocol.ts).
 
 ## Credits
 
-Browser MCP was adapted from the [Playwright MCP server](https://github.com/microsoft/playwright-mcp) in order to automate the user's browser rather than creating new browser instances. This allows using the user's existing browser profile to use logged-in sessions and avoid bot detection mechanisms that commonly block automated browser use.
+Browser MCP was adapted from the [Playwright MCP server](https://github.com/microsoft/playwright-mcp) in order to automate the user's browser rather than creating new browser instances.
