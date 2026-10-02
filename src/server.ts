@@ -1,92 +1,52 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import {
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ListToolsRequestSchema,
-  ReadResourceRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import { Context } from "@/context";
-import type { Resource } from "@/resources/resource";
-import type { Tool } from "@/tools/tool";
-import { createWebSocketServer } from "@/ws";
+import { ExtensionBridge, type BridgeOptions } from "./bridge";
+import { APP_NAME } from "./config";
+import { Context, type ContextOptions } from "./context";
+import { log } from "./log";
+import { tools } from "./tools";
 
-type Options = {
-  name: string;
-  version: string;
-  tools: Tool[];
-  resources: Resource[];
+export type ServerOptions = BridgeOptions & ContextOptions & { version: string };
+
+export type BrowserMcpServer = {
+  mcp: McpServer;
+  bridge: ExtensionBridge;
+  close: () => Promise<void>;
 };
 
-export async function createServerWithTools(options: Options): Promise<Server> {
-  const { name, version, tools, resources } = options;
-  const context = new Context();
-  const server = new Server(
-    { name, version },
-    {
-      capabilities: {
-        tools: {},
-        resources: {},
+export async function createServer(options: ServerOptions): Promise<BrowserMcpServer> {
+  const bridge = new ExtensionBridge(options);
+  const context = new Context(bridge, options);
+  const mcp = new McpServer({ name: APP_NAME, version: options.version });
+
+  for (const tool of tools) {
+    mcp.registerTool(
+      tool.name,
+      {
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        annotations: tool.annotations,
       },
-    },
-  );
-
-  const wss = await createWebSocketServer();
-  wss.on("connection", (websocket) => {
-    // Close any existing connections
-    if (context.hasWs()) {
-      context.ws.close();
-    }
-    context.ws = websocket;
-  });
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: tools.map((tool) => tool.schema) };
-  });
-
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
-    return { resources: resources.map((resource) => resource.schema) };
-  });
-
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const tool = tools.find((tool) => tool.schema.name === request.params.name);
-    if (!tool) {
-      return {
-        content: [
-          { type: "text", text: `Tool "${request.params.name}" not found` },
-        ],
-        isError: true,
-      };
-    }
-
-    try {
-      const result = await tool.handle(context, request.params.arguments);
-      return result;
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: String(error) }],
-        isError: true,
-      };
-    }
-  });
-
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    const resource = resources.find(
-      (resource) => resource.schema.uri === request.params.uri,
+      async (args) => {
+        try {
+          return await tool.handle(context, args);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log.debug(`${tool.name} failed:`, message);
+          return { content: [{ type: "text", text: message }], isError: true };
+        }
+      },
     );
-    if (!resource) {
-      return { contents: [] };
-    }
+  }
 
-    const contents = await resource.read(context, request.params.uri);
-    return { contents };
-  });
+  await bridge.start();
 
-  server.close = async () => {
-    await server.close();
-    await wss.close();
-    await context.close();
-  };
+  let closing: Promise<void> | undefined;
+  const close = () =>
+    (closing ??= (async () => {
+      await bridge.close();
+      await mcp.close();
+    })());
 
-  return server;
+  return { mcp, bridge, close };
 }
