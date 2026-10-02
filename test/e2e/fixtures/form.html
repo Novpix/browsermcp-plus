@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Fixture form</title>
+    <style>
+      #dropzone, #card { width: 120px; height: 60px; border: 1px solid #888; margin: 8px; }
+      #tall { height: 3000px; }
+      #hidden-file { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>Fixture form</h1>
+    <nav><a href="/page2.html">Second page</a></nav>
+    <form id="form" onsubmit="event.preventDefault(); document.getElementById('status').textContent = 'Submitted ' + document.getElementById('email').value;">
+      <label for="email">Email</label>
+      <input id="email" type="email" value="old@example.com" />
+      <label>Password <input id="password" type="password" /></label>
+      <textarea id="bio" aria-label="Bio"></textarea>
+      <select id="country" aria-label="Country">
+        <option value="us">United States</option>
+        <option value="tr">Türkiye</option>
+      </select>
+      <label><input id="terms" type="checkbox" /> Accept terms</label>
+      <button type="submit">Sign up</button>
+    </form>
+    <p id="status">Idle</p>
+
+    <button id="counter" onclick="this.textContent = 'Clicked ' + (++window.clicks) + 'x'; console.log('counter clicked', window.clicks)">Click me</button>
+    <div id="hover" onmouseenter="this.textContent = 'Hovered!'" role="note" aria-label="Hover target">Hover me</div>
+
+    <label for="file">Document</label>
+    <input id="file" type="file" multiple onchange="document.getElementById('files').textContent = [...this.files].map(f => f.name + ':' + f.size).join(',')" />
+    <input id="hidden-file" type="file" onchange="document.getElementById('files').textContent = 'avatar=' + this.files[0].name" />
+    <button id="avatar" type="button" onclick="document.getElementById('hidden-file').click()">Choose avatar</button>
+    <p id="files">No files</p>
+
+    <div id="card" role="group" aria-label="Card" draggable="true" ondragstart="event.dataTransfer.setData('text/plain', 'card')">Card</div>
+    <div id="dropzone" role="region" aria-label="Drop zone" ondragover="event.preventDefault()" ondrop="event.preventDefault(); this.textContent = 'Dropped ' + event.dataTransfer.getData('text/plain')">Drop here</div>
+
+    <div id="editor" contenteditable="true" aria-label="Editor">Draft text</div>
+    <iframe src="/frame.html" title="Inner frame" width="300" height="80"></iframe>
+    <div id="tall"></div>
+    <p id="bottom">Bottom of the page</p>
+    <script>
+      window.clicks = 0;
+      window.answer = 42;
+      console.log("fixture loaded");
+      console.warn("a warning", { a: 1 });
+    </script>
+  </body>
+</html>

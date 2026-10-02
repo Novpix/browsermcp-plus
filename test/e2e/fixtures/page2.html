@@ -1,0 +1,4 @@
+<!doctype html>
+<html><head><title>Second page</title></head><body><h1>Second page</h1><p>Loaded later</p>
+<script>setTimeout(() => { const p = document.createElement('p'); p.textContent = 'Async content ready'; document.body.append(p); }, 600);</script>
+</body></html>

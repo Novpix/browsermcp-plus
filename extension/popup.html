@@ -1,0 +1,102 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1f2328;
+        --muted: #59636e;
+        --bg: #ffffff;
+        --line: #d1d9e0;
+        --ok: #1a7f37;
+        --accent: #0969da;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6edf3;
+          --muted: #9198a1;
+          --bg: #151b23;
+          --line: #3d444d;
+          --ok: #3fb950;
+          --accent: #4493f8;
+        }
+      }
+      body {
+        margin: 0;
+        width: 280px;
+        padding: 14px;
+        font: 13px/1.4 system-ui, sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 14px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--line);
+        flex: none;
+      }
+      .dot.on {
+        background: var(--ok);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      button {
+        width: 100%;
+        margin-top: 10px;
+        padding: 8px;
+        border: 0;
+        border-radius: 6px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: transparent;
+        color: var(--fg);
+        border: 1px solid var(--line);
+      }
+      details {
+        margin-top: 12px;
+      }
+      input {
+        width: 80px;
+        font: inherit;
+        padding: 2px 4px;
+      }
+      #error {
+        color: #cf222e;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser MCP</h1>
+    <div class="row"><span id="tabDot" class="dot"></span><span id="tabStatus">…</span></div>
+    <div class="row"><span id="serverDot" class="dot"></span><span id="serverStatus">…</span></div>
+    <button id="toggle">Connect</button>
+    <div id="error"></div>
+    <details>
+      <summary class="muted">Settings</summary>
+      <div class="row">
+        <label for="port">Server port</label>
+        <input id="port" type="number" min="1" max="65535" />
+      </div>
+    </details>
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
