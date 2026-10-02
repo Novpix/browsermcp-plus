@@ -1,4 +1,4 @@
-// End-to-end test: real Chromium + the companion extension + the built server.
+// End-to-end test: real Chromium + the Browser MCP Plus extension + the built server.
 // Run with `npm run test:e2e` (requires `npm run build` and a Playwright Chromium).
 
 /// <reference lib="dom" />
@@ -15,7 +15,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { chromium, type BrowserContext, type Page, type Worker } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { COMPANION_EXTENSION_ID } from "../../src/config";
+import { PLUS_EXTENSION_ID } from "../../src/config";
 import { freePort } from "../helpers";
 
 const root = path.resolve(fileURLToPath(import.meta.url), "../../..");
@@ -111,9 +111,9 @@ afterAll(async () => {
   await new Promise((resolve) => site?.close(resolve));
 });
 
-describe("companion extension end to end", () => {
+describe("Browser MCP Plus extension end to end", () => {
   it("loads with the pinned extension id", () => {
-    expect(new URL(worker.url()).host).toBe(COMPANION_EXTENSION_ID);
+    expect(new URL(worker.url()).host).toBe(PLUS_EXTENSION_ID);
   });
 
   it("produces an accessibility snapshot with refs", async () => {

@@ -11,12 +11,12 @@ export function setVerbose(value: boolean) {
 
 export const log = {
   debug(...args: unknown[]) {
-    if (verbose) console.error("[browsermcp]", ...args);
+    if (verbose) console.error("[browsermcp-plus]", ...args);
   },
   info(...args: unknown[]) {
-    console.error("[browsermcp]", ...args);
+    console.error("[browsermcp-plus]", ...args);
   },
   error(...args: unknown[]) {
-    console.error("[browsermcp] error:", ...args);
+    console.error("[browsermcp-plus] error:", ...args);
   },
 };

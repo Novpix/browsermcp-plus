@@ -1,24 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+First release as **browsermcp-plus**, an independent project based on
+Browser MCP (see NOTICE).
 
 ### Added
 
-- Open-source companion extension (`extension/`), wire compatible with the
-  published one, with trusted CDP input, an accessibility snapshot with stable
+- Open-source Browser MCP Plus extension (`extension/`), wire compatible with
+  the original Browser MCP extension, with trusted CDP input, an accessibility snapshot with stable
   refs, and extra capabilities announced through a `hello` handshake.
-- Tools that need the companion extension: `browser_file_upload` (file inputs
+- Tools that need the Browser MCP Plus extension: `browser_file_upload` (file inputs
   and file-chooser buttons), `browser_evaluate`, `browser_scroll`,
   `browser_tab_list`, `browser_tab_new`, `browser_tab_select`,
   `browser_tab_close`. With the published extension they fail fast with an
   explanation instead of timing out.
 - End-to-end test suite running the extension in Chromium (`npm run test:e2e`).
+- Release assets: the extension as a zip and the server as a single
+  dependency-free `browsermcp-plus.cjs`.
 
 ## 0.2.0
 
+Hardening of Browser MCP 0.1.3 (also proposed upstream as BrowserMCP/mcp#205).
 The server no longer depends on the private monorepo it was extracted from and
 can be built, tested and published from this repository alone. It stays wire
-compatible with the published Browser MCP extension (1.3.x).
+compatible with the original Browser MCP extension (1.3.x).
 
 ### Security
 

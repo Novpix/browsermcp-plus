@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx playwright-core install --with-deps chromium
+      - run: npm run test:e2e
+
+      - name: Check versions match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          test "$(node -p "require('./package.json').version")" = "$tag"
+          test "$(node -p "require('./extension/manifest.json').version")" = "$tag"
+
+      - name: Package assets
+        run: |
+          mkdir -p release
+          cp dist/standalone/browsermcp-plus.cjs release/
+          (cd extension && zip -qr "../release/browsermcp-plus-extension-${GITHUB_REF_NAME}.zip" .)
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - name: Release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="## ${version}" '$0 == v {found=1; next} /^## / && found {exit} found' CHANGELOG.md > notes.md
+          test -s notes.md
+
+      - run: gh release create "$GITHUB_REF_NAME" release/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

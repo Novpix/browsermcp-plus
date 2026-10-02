@@ -1,4 +1,4 @@
-import { evaluate, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./companion";
+import { evaluate, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./plus";
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
 import { getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
@@ -20,7 +20,7 @@ export const tools: Tool[] = [
   waitFor,
   getConsoleLogs,
   screenshot,
-  // Companion extension only.
+  // Browser MCP Plus extension only.
   uploadFile,
   evaluate,
   scroll,

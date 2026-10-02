@@ -18,12 +18,12 @@ function integer(min: number) {
 }
 
 const program = new Command()
-  .name("mcp-server-browsermcp")
-  .description("MCP server that automates your browser through the Browser MCP extension")
+  .name("browsermcp-plus")
+  .description("MCP server that lets AI apps automate your own browser through the Browser MCP Plus extension")
   .version(packageJSON.version)
   .option(
     "--port <number>",
-    "WebSocket port the extension connects to (the published extension always uses 9009)",
+    "WebSocket port the extension connects to (the original Browser MCP extension always uses 9009)",
     integer(1),
     DEFAULT_WS_PORT,
   )

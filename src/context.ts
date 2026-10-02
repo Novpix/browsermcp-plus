@@ -1,6 +1,6 @@
 import type { ExtensionBridge } from "./bridge";
-import { DEFAULT_CONNECT_WAIT_MS, DEFAULT_REQUEST_TIMEOUT_MS } from "./config";
-import { COMPANION_MESSAGES, type MessageType, type Payload, type Result } from "./protocol";
+import { DEFAULT_CONNECT_WAIT_MS, DEFAULT_REQUEST_TIMEOUT_MS, REPOSITORY_URL } from "./config";
+import { PLUS_MESSAGES, type MessageType, type Payload, type Result } from "./protocol";
 
 export type ContextOptions = {
   /** Timeout for a single extension request. */
@@ -36,11 +36,11 @@ export class Context {
     options: { timeoutMs?: number } = {},
   ): Promise<Result<T>> {
     const connection = await this.bridge.getConnection(this.connectWaitMs);
-    if (COMPANION_MESSAGES.has(type)) {
+    if (PLUS_MESSAGES.has(type)) {
       await connection.ready;
       if (!connection.supports(type)) {
         throw new Error(
-          `This tool needs the open-source Browser MCP Companion extension (extension/ in the Browser MCP repository); the connected extension does not support "${type}".`,
+          `This tool needs the Browser MCP Plus extension (${REPOSITORY_URL}); the connected extension does not support "${type}".`,
         );
       }
     }

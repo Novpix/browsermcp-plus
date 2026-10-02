@@ -27,7 +27,7 @@ export class FakeExtension {
 
   constructor(
     public handlers: Record<string, Handler> = {},
-    /** Capabilities announced in `hello`, like the companion extension; none = original extension. */
+    /** Capabilities announced in `hello`, like the Browser MCP Plus extension; none = original extension. */
     private readonly capabilities?: string[],
   ) {}
 
@@ -38,7 +38,7 @@ export class FakeExtension {
       this.ws.send(
         JSON.stringify({
           type: "hello",
-          payload: { name: "browsermcp-companion", version: "test", capabilities: this.capabilities },
+          payload: { name: "browsermcp-plus", version: "test", capabilities: this.capabilities },
         }),
       );
     });
