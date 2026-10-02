@@ -47,7 +47,7 @@ export type ExtensionMessages = {
     result: unknown[];
   };
 
-  // Companion extension only (announced through `hello` capabilities).
+  // Browser MCP Plus extension only (announced through `hello` capabilities).
   browser_upload_file: { payload: ElementRef & { paths: string[] }; result: unknown };
   browser_evaluate: {
     payload: { function: string; ref?: string; element?: string };
@@ -79,8 +79,8 @@ export type EvaluateResult = {
   description?: string;
 };
 
-/** Messages only the companion extension understands. */
-export const COMPANION_MESSAGES = new Set<MessageType>([
+/** Messages only the Browser MCP Plus extension understands. */
+export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_upload_file",
   "browser_evaluate",
   "browser_scroll",
@@ -90,7 +90,7 @@ export const COMPANION_MESSAGES = new Set<MessageType>([
   "browser_tab_close",
 ]);
 
-/** Sent by the companion extension right after connecting. */
+/** Sent by the Browser MCP Plus extension right after connecting. */
 export type ExtensionInfo = {
   name: string;
   version: string;
@@ -139,13 +139,13 @@ export class ExtensionConnection {
     ws.on("error", () => this.onClose());
   }
 
-  /** Present when the companion extension is connected. */
+  /** Present when the Browser MCP Plus extension is connected. */
   get info(): ExtensionInfo | undefined {
     return this._info;
   }
 
   supports(type: MessageType): boolean {
-    return !COMPANION_MESSAGES.has(type) || !!this._info?.capabilities.includes(type);
+    return !PLUS_MESSAGES.has(type) || !!this._info?.capabilities.includes(type);
   }
 
   get isOpen(): boolean {

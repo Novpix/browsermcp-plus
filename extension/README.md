@@ -1,8 +1,8 @@
-# Browser MCP Companion extension
+# Browser MCP Plus extension
 
-An open-source Chromium extension for the Browser MCP server. It speaks the
-same WebSocket protocol as the published Browser MCP extension, so every
-existing tool works, and adds what the closed extension cannot do:
+The open-source Chromium extension of browsermcp-plus. It speaks the same
+WebSocket protocol as the original Browser MCP extension, so every existing
+tool works, and adds what that closed extension cannot do:
 
 | Tool | What it does |
 | --- | --- |
@@ -14,7 +14,8 @@ existing tool works, and adds what the closed extension cannot do:
 ## Install (unpacked)
 
 1. Open `chrome://extensions` and turn on **Developer mode**.
-2. Click **Load unpacked** and pick this `extension/` folder.
+2. Click **Load unpacked** and pick this `extension/` folder (or the unzipped
+   `browsermcp-plus-extension-*.zip` from a release).
 3. **Disable the original Browser MCP extension** — both would compete for the
    same server connection.
 4. Open the tab you want to automate, click the toolbar icon (or press

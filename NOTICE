@@ -1,0 +1,11 @@
+browsermcp-plus
+Copyright 2026 Novpix
+
+This product is a derivative of Browser MCP (https://github.com/BrowserMCP/mcp),
+licensed under the Apache License 2.0. Browser MCP was itself adapted from the
+Playwright MCP server (https://github.com/microsoft/playwright-mcp),
+Copyright (c) Microsoft Corporation, licensed under the Apache License 2.0.
+
+"Browser MCP" is the name of the original project. browsermcp-plus is an
+independent project and is not affiliated with or endorsed by the Browser MCP
+authors. Changes relative to Browser MCP are listed in CHANGELOG.md.

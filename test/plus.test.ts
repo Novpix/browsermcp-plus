@@ -6,10 +6,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { COMPANION_ORIGIN } from "../src/config";
-import { COMPANION_MESSAGES } from "../src/protocol";
+import { PLUS_ORIGIN } from "../src/config";
+import { PLUS_MESSAGES } from "../src/protocol";
 import { createServer } from "../src/server";
-import { formatEvaluateResult } from "../src/tools/companion";
+import { formatEvaluateResult } from "../src/tools/plus";
 import { FakeExtension, fakePage, freePort, waitUntil } from "./helpers";
 
 const cleanups: (() => unknown)[] = [];
@@ -17,7 +17,7 @@ afterEach(async () => {
   for (const fn of cleanups.splice(0).reverse()) await fn();
 });
 
-async function setup({ companion }: { companion: boolean }) {
+async function setup({ plus }: { plus: boolean }) {
   const port = await freePort();
   const server = await createServer({ version: "test", port, connectWaitMs: 200 });
   cleanups.push(() => server.close());
@@ -40,8 +40,8 @@ async function setup({ companion }: { companion: boolean }) {
     browser_tab_select: ({ tabId }: { tabId: number }) => ({ ...tabs[1], id: tabId, connected: true }),
     browser_tab_close: () => tabs[1],
   });
-  const extension = new FakeExtension(handlers, companion ? [...COMPANION_MESSAGES] : undefined);
-  await extension.connect(port, companion ? COMPANION_ORIGIN : undefined);
+  const extension = new FakeExtension(handlers, plus ? [...PLUS_MESSAGES] : undefined);
+  await extension.connect(port, plus ? PLUS_ORIGIN : undefined);
   cleanups.push(() => extension.close());
   await waitUntil(() => server.bridge.isConnected);
 
@@ -55,19 +55,19 @@ async function setup({ companion }: { companion: boolean }) {
   return { call, extension, page };
 }
 
-describe("companion tools", () => {
+describe("Browser MCP Plus tools", () => {
   it("explain that the original extension does not support them", async () => {
-    const { call, extension } = await setup({ companion: false });
+    const { call, extension } = await setup({ plus: false });
     const started = Date.now();
     const result = await call("browser_tab_list");
     expect(result.isError).toBe(true);
-    expect(result.text).toMatch(/Companion extension/);
+    expect(result.text).toMatch(/Browser MCP Plus extension/);
     expect(Date.now() - started).toBeLessThan(3_000);
     expect(extension.received.map((m) => m.type)).not.toContain("browser_tab_list");
   });
 
   it("upload resolves and validates paths before sending them", async () => {
-    const { call, extension } = await setup({ companion: true });
+    const { call, extension } = await setup({ plus: true });
     const dir = await mkdtemp(path.join(os.tmpdir(), "bmcp-"));
     const file = path.join(dir, "avatar.png");
     await writeFile(file, "x");
@@ -91,7 +91,7 @@ describe("companion tools", () => {
   });
 
   it("evaluate returns the serialised result", async () => {
-    const { call, extension } = await setup({ companion: true });
+    const { call, extension } = await setup({ plus: true });
     const result = await call("browser_evaluate", { function: "() => ({answer: 42})" });
     expect(JSON.parse(result.text)).toEqual({ answer: 42 });
     expect(extension.received.at(-1)).toEqual({
@@ -101,14 +101,14 @@ describe("companion tools", () => {
   });
 
   it("scroll requires a delta or a ref", async () => {
-    const { call } = await setup({ companion: true });
+    const { call } = await setup({ plus: true });
     expect((await call("browser_scroll", {})).isError).toBe(true);
     const ok = await call("browser_scroll", { deltaY: 600 });
     expect(ok.text).toContain("Scrolled by 0, 600");
   });
 
   it("tab tools format and forward ids", async () => {
-    const { call, extension } = await setup({ companion: true });
+    const { call, extension } = await setup({ plus: true });
     const list = await call("browser_tab_list");
     expect(list.text).toBe(
       [

@@ -1,21 +1,32 @@
 {
-  "name": "@browsermcp/mcp",
-  "version": "0.2.0",
-  "description": "MCP server for browser automation using the Browser MCP extension",
-  "author": "Browser MCP",
+  "name": "browsermcp-plus",
+  "version": "0.3.0",
+  "description": "MCP server + open-source Chrome extension that let AI apps automate your own browser: clicks, typing, file uploads, tabs, JavaScript",
+  "author": "Novpix",
   "license": "Apache-2.0",
-  "homepage": "https://browsermcp.io",
-  "bugs": "https://github.com/browsermcp/mcp/issues",
+  "homepage": "https://github.com/Novpix/browsermcp-plus#readme",
+  "bugs": "https://github.com/Novpix/browsermcp-plus/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BrowserMCP/mcp.git"
+    "url": "git+https://github.com/Novpix/browsermcp-plus.git"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser-automation",
+    "chrome-extension",
+    "claude",
+    "cursor",
+    "ai-agent",
+    "file-upload"
+  ],
   "type": "module",
   "bin": {
-    "mcp-server-browsermcp": "dist/index.js"
+    "browsermcp-plus": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist/index.js",
+    "dist/index.js.map"
   ],
   "engines": {
     "node": ">=18"

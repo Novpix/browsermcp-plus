@@ -1,4 +1,4 @@
-// Browser MCP Companion: background service worker.
+// Browser MCP Plus: background service worker.
 //
 // Speaks the Browser MCP WebSocket protocol with the local MCP server and
 // drives the connected tab through the debugger API (trusted input events,
@@ -125,7 +125,7 @@ function ensureSocket() {
     send(ws, {
       type: "hello",
       payload: {
-        name: "browsermcp-companion",
+        name: "browsermcp-plus",
         version: chrome.runtime.getManifest().version,
         capabilities: CAPABILITIES,
       },
@@ -547,7 +547,7 @@ const handlers = {
     return state.consoleLogs;
   },
 
-  // --- Companion-only messages -------------------------------------------
+  // --- Browser MCP Plus-only messages -------------------------------------------
 
   async browser_upload_file({ ref, paths }) {
     const tabId = requireTab();

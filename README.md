@@ -1,84 +1,100 @@
-<a href="https://browsermcp.io">
-  <img src="./.github/images/banner.png" alt="Browser MCP banner">
-</a>
+# browsermcp-plus
 
-<h3 align="center">Browser MCP</h3>
+**Let AI apps drive your own browser — including file uploads, tabs and JavaScript.**
 
-<p align="center">
-  Automate your browser with AI.
-  <br />
-  <a href="https://browsermcp.io"><strong>Website</strong></a>
-  •
-  <a href="https://docs.browsermcp.io"><strong>Docs</strong></a>
-</p>
+browsermcp-plus is an [MCP](https://modelcontextprotocol.io) server and an
+open-source Chrome extension. Claude, Cursor, VS Code, Windsurf and any other
+MCP client can click, type, upload files and read pages in the tab you
+connect, using your real browser profile: you stay logged in, nothing runs in
+the cloud, and sites see a normal browser.
 
-## About
+It started as a hardened fork of [Browser MCP](https://github.com/BrowserMCP/mcp)
+and stays compatible with its extension. [Türkçe README](README.tr.md)
 
-Browser MCP is an MCP server + Chrome extension that allows you to automate your browser using AI applications like VS Code, Claude, Cursor, and Windsurf.
+## What's different from Browser MCP
 
-- ⚡ Fast: automation happens locally on your machine, without network latency.
-- 🔒 Private: your browser activity stays on your device.
-- 👤 Logged in: uses your existing browser profile and sessions.
-- 🥷🏼 Stealth: uses your real browser fingerprint, avoiding basic bot detection.
+| | Browser MCP | browsermcp-plus |
+| --- | --- | --- |
+| File upload | ✗ | ✓ file inputs *and* "choose file" buttons, no OS dialog |
+| Run JavaScript, tabs, scrolling | ✗ | ✓ |
+| Extension source | closed | open source ([`extension/`](extension/)) |
+| Server reachable from the network | yes, all interfaces | loopback only |
+| Any web page can connect to the server | yes | no, origin allowlist |
+| Starting a second client | `kill -9` on the port | cooperative hand-over, then resume |
+| Builds from its own repository, tests, CI | ✗ | ✓ unit + real-browser end-to-end tests |
 
-## Setup
+## Install
 
-1. Install the [Browser MCP extension](https://chromewebstore.google.com/detail/browser-mcp-automate-your/bjfgambnhccakkhmkepdoekmckoijdlc).
-2. Add the server to your MCP client:
+**1. Extension** — download `browsermcp-plus-extension-*.zip` from the
+[latest release](https://github.com/Novpix/browsermcp-plus/releases/latest)
+and unzip it, then in Chrome (or Edge, Brave, Arc…):
 
-   ```json
-   {
-     "mcpServers": {
-       "browsermcp": {
-         "command": "npx",
-         "args": ["@browsermcp/mcp@latest"]
-       }
-     }
-   }
-   ```
+1. open `chrome://extensions` and enable **Developer mode**,
+2. click **Load unpacked** and choose the unzipped folder,
+3. if you have the original Browser MCP extension, disable it.
 
-3. Click the extension icon on the tab you want to automate and press **Connect**.
+**2. Server** — add it to your MCP client. Either run it straight from GitHub
+(needs Node.js 18+ and git):
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "command": "npx",
+      "args": ["-y", "github:Novpix/browsermcp-plus"]
+    }
+  }
+}
+```
+
+or download `browsermcp-plus.cjs` from the release — a single file with no
+dependencies — and point the client at it:
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "command": "node",
+      "args": ["/path/to/browsermcp-plus.cjs"]
+    }
+  }
+}
+```
+
+Claude Code: `claude mcp add browser -- npx -y github:Novpix/browsermcp-plus`
+
+**3. Connect** — open the tab you want to automate, click the extension icon
+(<kbd>Alt</kbd>+<kbd>J</kbd>) and press **Connect**. The icon shows `ON`.
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
 | `browser_navigate` | Open a URL (`example.com` → `https://example.com`) |
-| `browser_go_back` / `browser_go_forward` | History navigation |
-| `browser_reload` | Reload the current page |
+| `browser_go_back` / `browser_go_forward` / `browser_reload` | History and reload |
 | `browser_snapshot` | Accessibility snapshot with element refs |
 | `browser_click` / `browser_hover` | Act on an element from the snapshot |
 | `browser_type` | Type into an element, optionally pressing Enter |
 | `browser_select_option` | Choose dropdown values |
-| `browser_drag` | Drag one element onto another |
-| `browser_press_key` | Press a key (`Enter`, `Escape`, `PageDown`, …) |
-| `browser_wait` | Wait a number of seconds |
-| `browser_wait_for` | Wait until text appears or disappears |
+| `browser_drag` | Drag one element onto another (incl. HTML5 drag and drop) |
+| `browser_press_key` | Keys and shortcuts (`Enter`, `PageDown`, `Control+a`, …) |
+| `browser_file_upload` | Upload local files through a file input or a "choose file" button |
+| `browser_evaluate` | Run JavaScript in the page, optionally on a snapshot element |
+| `browser_scroll` | Scroll by pixels or scroll an element into view |
+| `browser_tab_list` / `_new` / `_select` / `_close` | Work across tabs |
+| `browser_wait` / `browser_wait_for` | Wait for time, or for text to appear/disappear |
 | `browser_get_console_logs` | Read the page console |
 | `browser_screenshot` | PNG of the visible viewport |
 
-Tools carry MCP annotations so clients can skip confirmation for read-only tools.
-
-### Companion extension
-
-The open-source [companion extension](extension/) speaks the same protocol and
-unlocks extra tools that the published extension cannot support:
-
-| Tool | Description |
-| --- | --- |
-| `browser_file_upload` | Upload local files via a file input or the button that opens the file chooser |
-| `browser_evaluate` | Run JavaScript in the page, optionally on a snapshot element |
-| `browser_scroll` | Scroll by pixels or scroll an element into view |
-| `browser_tab_list` / `_new` / `_select` / `_close` | Tab management |
-
-With the published extension these tools return an error explaining that they
-need the companion extension.
+Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) so clients can
+skip confirmation for read-only ones. With the original Browser MCP extension
+everything except upload, evaluate, scroll and tabs works.
 
 ## Options
 
 ```
---port <number>            WebSocket port (the published extension always uses 9009)
---allow-origin <origin...> extra origins allowed to connect as the extension
+--port <number>            WebSocket port (default 9009)
+--allow-origin <origin...> extra extension origins allowed to connect
 --no-takeover              don't ask a running server to hand over the port
 --kill-existing            terminate a non-cooperating process on the port
 --request-timeout <ms>     timeout for a single browser action (default 30000)
@@ -87,35 +103,35 @@ need the companion extension.
 --verbose                  debug logging on stderr
 ```
 
-## Multiple MCP clients
+## Several MCP clients
 
-Only one server can talk to the extension at a time. When a second client starts
-the server, the new instance asks the running one to hand over the port. The
-older instance switches to standby and takes over again once the newer one
-exits. If the port is held by something that does not cooperate (for example a
-0.1.x server), the server still starts and its tools explain the problem; pass
-`--kill-existing` to terminate that process instead.
+Only one server can talk to the extension at a time. When another client
+starts the server, the new instance asks the running one to hand over the port;
+the older one waits and takes over again once the newer one exits.
 
 ## Security model
 
-- The WebSocket endpoint listens on loopback only.
-- Connections are accepted only from the extension's origin
-  (`chrome-extension://bjfgambnhccakkhmkepdoekmckoijdlc`), so web pages you
-  visit cannot connect to the server and impersonate the extension.
-- Local processes running as your user are trusted, as with any local MCP server.
+- The server listens on `127.0.0.1` / `::1` only.
+- Only the extension origins may connect, so web pages you visit cannot talk to
+  the server or impersonate the extension.
+- The extension acts only on the tab you connect; Chrome shows its
+  "is debugging this browser" bar while it does.
 - Page content returned by the tools is untrusted input for the model.
 
 ## Development
 
 ```sh
 npm install
-npm run check     # typecheck + tests + build
-npm run test:e2e  # real Chromium + companion extension (needs a Playwright Chromium)
-npm run inspector # try the server in the MCP Inspector
+npm run check     # typecheck + unit tests + build
+npm run test:e2e  # real Chromium + extension end to end
 ```
 
-The extension's wire protocol is documented in [`src/protocol.ts`](src/protocol.ts).
+The wire protocol is documented in [`src/protocol.ts`](src/protocol.ts), the
+extension in [`extension/README.md`](extension/README.md).
 
-## Credits
+## License
 
-Browser MCP was adapted from the [Playwright MCP server](https://github.com/microsoft/playwright-mcp) in order to automate the user's browser rather than creating new browser instances.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) — based on
+[Browser MCP](https://github.com/BrowserMCP/mcp), which was adapted from
+[Playwright MCP](https://github.com/microsoft/playwright-mcp). Not affiliated
+with the Browser MCP authors.

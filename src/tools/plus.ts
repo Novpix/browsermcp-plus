@@ -9,7 +9,7 @@ import { actionResult } from "../snapshot";
 import { normalizeUrl } from "./navigation";
 import { defineTool, NAVIGATION, PAGE_MUTATION, READ_ONLY, text } from "./tool";
 
-// Tools in this file need the Browser MCP Companion extension (extension/).
+// Tools in this file need the Browser MCP Plus extension (extension/).
 
 const element = z
   .string()

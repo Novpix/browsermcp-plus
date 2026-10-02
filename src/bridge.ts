@@ -142,7 +142,7 @@ export class ExtensionBridge {
     for (const host of LOOPBACK_HOSTS) {
       const server = http.createServer((_req, res) => {
         res.writeHead(426, { "content-type": "text/plain" });
-        res.end("Browser MCP: WebSocket endpoint\n");
+        res.end("browsermcp-plus: WebSocket endpoint\n");
       });
       server.on("upgrade", (req, socket, head) =>
         this.onUpgrade(req, socket, head),
