@@ -4,10 +4,10 @@ import path from "node:path";
 
 import { z } from "zod";
 
-import type { EvaluateResult, TabInfo } from "../protocol";
-import { actionResult } from "../snapshot";
+import { isActionReport, type EvaluateResult, type TabInfo } from "../protocol";
+import { actionResult, snapshotResult } from "../snapshot";
 import { normalizeUrl } from "./navigation";
-import { defineTool, NAVIGATION, PAGE_MUTATION, READ_ONLY, text } from "./tool";
+import { defineTool, NAVIGATION, PAGE_MUTATION, READ_ONLY, snapshotOption, text } from "./tool";
 
 // Tools in this file need the Browser MCP Plus extension (extension/).
 
@@ -28,13 +28,14 @@ export const uploadFile = defineTool({
       .array(z.string().min(1))
       .min(1)
       .describe("Absolute paths of the files to upload (`~` is expanded)"),
+    snapshot: snapshotOption("no"),
   }),
   annotations: PAGE_MUTATION,
   handle: async (context, args) => {
     const paths = await resolveFiles(args.paths);
-    await context.send("browser_upload_file", { element: args.element, ref: args.ref, paths });
+    const result = await context.send("browser_upload_file", { element: args.element, ref: args.ref, paths });
     const names = paths.map((p) => path.basename(p)).join(", ");
-    return actionResult(context, `Uploaded ${names} via "${args.element}"`);
+    return actionResult(context, `Uploaded ${names} via "${args.element}"`, result, { snapshot: args.snapshot });
   },
 });
 
@@ -86,19 +87,29 @@ export const scroll = defineTool({
     deltaX: z.number().optional().describe("Horizontal pixels; positive scrolls right"),
     element: element.optional(),
     ref: z.string().min(1).optional().describe("Element to scroll into view instead"),
+    snapshot: snapshotOption("no"),
   }),
   annotations: NAVIGATION,
-  handle: async (context, args) => {
+  handle: async (context, { snapshot, ...args }) => {
     if (!args.ref && !args.deltaX && !args.deltaY) {
       throw new Error("Provide `deltaY`/`deltaX`, or a `ref` to scroll into view");
     }
-    await context.send("browser_scroll", args);
+    const result = await context.send("browser_scroll", args);
     const status = args.ref
       ? `Scrolled "${args.element ?? args.ref}" into view`
       : `Scrolled by ${args.deltaX ?? 0}, ${args.deltaY ?? 0}`;
-    return actionResult(context, status);
+    return actionResult(context, status, result, { snapshot });
   },
 });
+
+/** The tab switch succeeded even if its page (e.g. about:blank) cannot be read. */
+async function tabResult(context: Parameters<typeof snapshotResult>[0], status: string) {
+  try {
+    return await snapshotResult(context, status);
+  } catch (error) {
+    return text(`${status}. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 function formatTab(tab: TabInfo): string {
   const flags = [tab.connected && "connected", tab.active && "active"].filter(Boolean);
@@ -126,7 +137,7 @@ export const tabNew = defineTool({
   annotations: NAVIGATION,
   handle: async (context, { url }) => {
     const tab = await context.send("browser_tab_new", { url: url && normalizeUrl(url) });
-    return actionResult(context, `Opened tab ${tab.id}`);
+    return tabResult(context, `Opened tab ${tab.id}`);
   },
 });
 
@@ -139,7 +150,7 @@ export const tabSelect = defineTool({
   annotations: NAVIGATION,
   handle: async (context, { tabId }) => {
     await context.send("browser_tab_select", { tabId });
-    return actionResult(context, `Switched to tab ${tabId}`);
+    return tabResult(context, `Switched to tab ${tabId}`);
   },
 });
 
@@ -155,6 +166,54 @@ export const tabClose = defineTool({
     const next = await context.send("browser_tab_close", { tabId });
     const closed = `Closed tab${tabId === undefined ? "" : ` ${tabId}`}`;
     if (!next) return text(closed);
-    return actionResult(context, `${closed}; now connected to tab ${next.id}`);
+    return tabResult(context, `${closed}; now connected to tab ${next.id}`);
+  },
+});
+
+export const handleDialog = defineTool({
+  name: "browser_handle_dialog",
+  description:
+    "Accept or dismiss the JavaScript dialog (alert, confirm, prompt, beforeunload) that is blocking the page",
+  inputSchema: z.object({
+    accept: z.boolean().describe("true to press OK / accept, false to press Cancel / dismiss"),
+    promptText: z.string().optional().describe("Text to enter into a prompt() dialog before accepting"),
+    snapshot: snapshotOption("no"),
+  }),
+  annotations: PAGE_MUTATION,
+  handle: async (context, { snapshot, ...args }) => {
+    const result = await context.send("browser_handle_dialog", args);
+    const status = isActionReport(result) && typeof result.value === "string" ? result.value : "Handled the dialog";
+    return actionResult(context, status, result, { snapshot });
+  },
+});
+
+export const fillForm = defineTool({
+  name: "browser_fill_form",
+  description:
+    "Fill several form fields in one call: text fields, checkboxes, radio buttons, native dropdowns and sliders. Faster and more reliable than separate typing and clicking.",
+  inputSchema: z.object({
+    fields: z
+      .array(
+        z.object({
+          name: z.string().describe("Human-readable field name"),
+          type: z
+            .enum(["textbox", "searchbox", "spinbutton", "checkbox", "radio", "switch", "combobox", "listbox", "slider"])
+            .describe("The field's role from the snapshot"),
+          ref: z.string().min(1).describe("Exact field reference from the page snapshot"),
+          value: z
+            .string()
+            .describe('Text to enter; "true"/"false" for checkboxes, radios and switches; the option label for dropdowns'),
+        }),
+      )
+      .min(1)
+      .describe("Fields to fill, in order"),
+    snapshot: snapshotOption("no"),
+  }),
+  annotations: PAGE_MUTATION,
+  handle: async (context, { fields, snapshot }) => {
+    const result = await context.send("browser_fill_form", { fields });
+    const filled = isActionReport(result) && Array.isArray(result.value) ? result.value : [];
+    const status = [`Filled ${fields.length} field${fields.length === 1 ? "" : "s"}:`, ...filled.map((f) => `  - ${f}`)].join("\n");
+    return actionResult(context, status, result, { snapshot });
   },
 });

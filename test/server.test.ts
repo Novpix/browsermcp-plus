@@ -65,6 +65,9 @@ describe("MCP server", () => {
         "browser_file_upload",
         "browser_evaluate",
         "browser_scroll",
+        "browser_find",
+        "browser_fill_form",
+        "browser_handle_dialog",
         "browser_tab_list",
         "browser_tab_new",
         "browser_tab_select",
@@ -117,20 +120,86 @@ describe("MCP server", () => {
     ]);
   });
 
-  it("can skip the snapshot after actions", async () => {
-    const { call, extension } = await setup({ actionSnapshots: false });
-    const result = await call("browser_click", { element: "Sign in", ref: "s1e3" });
-    expect(result.text).toBe('Clicked "Sign in"');
-    expect(extension.received.map((m) => m.type)).toEqual(["browser_click"]);
+  it("actions return a short report by default and a snapshot on request", async () => {
+    const { call, extension } = await setup();
+    const short = await call("browser_click", { element: "Sign in", ref: "s1e3" });
+    expect(short.text).toContain('Clicked "Sign in"');
+    expect(short.text).toContain("- Page URL: https://example.com/");
+    expect(short.text).not.toContain("Page Snapshot");
+    expect(extension.received.map((m) => m.type)).toEqual(["browser_click", "getUrl", "getTitle"]);
+
+    const full = await call("browser_click", { element: "Sign in", ref: "s1e3", snapshot: true });
+    expect(full.text).toContain('button "Sign in" [ref=s1e3]');
   });
 
-  it("truncates long snapshots when configured", async () => {
-    const { call, page } = await setup({ snapshotMaxChars: 10 });
-    page.snapshot = "x".repeat(100);
+  it("can always include snapshots after actions", async () => {
+    const { call } = await setup({ actionSnapshots: true });
+    const result = await call("browser_click", { element: "Sign in", ref: "s1e3" });
+    expect(result.text).toContain("- Page Snapshot");
+  });
+
+  it("formats the Plus extension's action report", async () => {
+    const { call, extension } = await setup();
+    extension.handlers.browser_click = () => ({
+      url: "https://example.com/next",
+      title: "Next",
+      navigated: true,
+      newTabs: [{ id: 7, windowId: 1, title: "Help", url: "https://help.example.com/", active: true, connected: false }],
+    });
+    const navigated = await call("browser_click", { element: "Next", ref: "s1e3" });
+    expect(navigated.text).toContain("- Page URL: https://example.com/next");
+    expect(navigated.text).toContain("The action loaded a new page.");
+    expect(navigated.text).toContain("New tab opened: [7] Help");
+    expect(extension.received.map((m) => m.type)).toEqual(["browser_click"]);
+
+    extension.handlers.browser_click = () => ({
+      url: "https://example.com/",
+      title: "Example",
+      navigated: false,
+      dialog: { type: "confirm", message: "Delete it?" },
+    });
+    const dialog = await call("browser_click", { element: "Delete", ref: "s1e3", snapshot: true });
+    expect(dialog.text).toContain('A JavaScript confirm dialog is open: "Delete it?"');
+    expect(dialog.text).toContain("browser_handle_dialog");
+    // The page is blocked, so no snapshot is attempted.
+    expect(extension.received.filter((m) => m.type === "browser_snapshot")).toHaveLength(0);
+  });
+
+  it("returns the subtree of a ref and finds elements by text", async () => {
+    const { call, page } = await setup();
+    page.snapshot = [
+      '- navigation "Main" [ref=e1]:',
+      '  - link "Home" [ref=e2]:',
+      "    - /url: https://example.com/",
+      '  - link "Pricing" [ref=e3]:',
+      "    - /url: https://example.com/pricing",
+      "- main [ref=e4]:",
+      '  - heading "Plans" [level=1] [ref=e5]',
+      '  - button "Buy pricing plan" [ref=e6]',
+    ].join("\n");
+    const subtree = await call("browser_snapshot", { ref: "e1" });
+    expect(subtree.text).toContain('link "Pricing" [ref=e3]');
+    expect(subtree.text).not.toContain("Plans");
+
+    const found = await call("browser_find", { text: "pricing" });
+    expect(found.text).toContain("- 3 matches");
+    expect(found.text).toContain('navigation "Main" [ref=e1]');
+    expect(found.text).toContain('link "Pricing" [ref=e3]');
+    expect(found.text).toContain("/url: https://example.com/pricing");
+    expect(found.text).toContain('button "Buy pricing plan" [ref=e6]');
+    expect(found.text).not.toContain('link "Home"');
+
+    expect((await call("browser_find", { text: "nothing like this" })).text).toContain("No elements match");
+    expect((await call("browser_snapshot", { ref: "e99" })).isError).toBe(true);
+  });
+
+  it("truncates long snapshots at a line boundary", async () => {
+    const { call, page } = await setup({ snapshotMaxChars: 25 });
+    page.snapshot = Array.from({ length: 10 }, (_, i) => `- text: line ${i}`).join("\n");
     const result = await call("browser_snapshot");
-    expect(result.text).toContain("x".repeat(10) + "\n```");
-    expect(result.text).not.toContain("x".repeat(11));
-    expect(result.text).toContain("truncated to 10 of 100 characters");
+    expect(result.text).toContain("- text: line 0");
+    expect(result.text).not.toContain("line 9");
+    expect(result.text).toMatch(/truncated \(\d+ characters\)\. Use browser_find/);
   });
 
   it("reload re-navigates to the current URL", async () => {

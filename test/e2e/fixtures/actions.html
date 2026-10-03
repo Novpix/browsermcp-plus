@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Fixture actions</title>
+    <style>
+      #covered-wrap { position: relative; display: inline-block; }
+      #banner { position: absolute; inset: -10px; background: rgba(0, 0, 0, 0.6); }
+    </style>
+  </head>
+  <body>
+    <h1>Actions</h1>
+    <p id="status">Idle</p>
+
+    <button onclick="document.getElementById('status').textContent = confirm('Delete item?') ? 'Deleted' : 'Kept'">Delete</button>
+    <button onclick="alert('Saved!'); document.getElementById('status').textContent = 'Alerted'">Save</button>
+    <button onclick="const n = prompt('Your name?', ''); document.getElementById('status').textContent = 'Hello ' + n">Ask name</button>
+
+    <div id="covered-wrap">
+      <button onclick="document.getElementById('status').textContent = 'Covered clicked'">Buy now</button>
+      <div id="banner" role="dialog" aria-label="Cookie consent">
+        <button onclick="document.getElementById('banner').remove()">Accept cookies</button>
+      </div>
+    </div>
+    <button disabled>Disabled action</button>
+    <button aria-label="Settings" onclick="document.getElementById('status').textContent = 'Settings opened'"><svg width="16" height="16"><circle cx="8" cy="8" r="6" /></svg></button>
+    <button onclick="document.getElementById('status').textContent = 'Search opened'"><img alt="Search" width="16" height="16" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" /></button>
+
+    <a href="/page2.html" target="_blank">Open help in new tab</a>
+    <button onclick="setTimeout(() => (location.href = '/page2.html'), 400)">Delayed login</button>
+
+    <form onsubmit="event.preventDefault()">
+      <label>Full name <input id="name" /></label>
+      <label>Phone <input id="phone" oninput="const d = this.value.replace(/\D/g, '').slice(0, 10); this.value = d.length > 6 ? '(' + d.slice(0, 3) + ') ' + d.slice(3, 6) + '-' + d.slice(6) : d.length > 3 ? '(' + d.slice(0, 3) + ') ' + d.slice(3) : d;" /></label>
+      <label>Birthday <input id="birthday" type="date" /></label>
+      <label><input id="news" type="checkbox" checked /> Newsletter</label>
+      <label><input id="agree" type="checkbox" /> I agree</label>
+      <label><input type="radio" name="plan" value="basic" checked /> Basic</label>
+      <label><input id="pro" type="radio" name="plan" value="pro" /> Pro</label>
+      <label>Size <select id="size"><option>Small</option><option>Large</option></select></label>
+      <label>Volume <input id="volume" type="range" min="0" max="10" value="2" /></label>
+    </form>
+  </body>
+</html>

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { chromium, type BrowserContext, type Page, type Worker } from "playwright-core";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { PLUS_EXTENSION_ID } from "../../src/config";
 import { freePort } from "../helpers";
@@ -147,6 +147,7 @@ describe("Browser MCP Plus extension end to end", () => {
       ref: ref(snap, /textbox "Password"/),
       text: "s3cret",
       submit: true,
+      snapshot: true,
     });
     expect(await page.inputValue("#password")).toBe("s3cret");
     expect(await domText("#status")).toBe("Submitted new@example.com");
@@ -162,7 +163,7 @@ describe("Browser MCP Plus extension end to end", () => {
 
   it("clicks with trusted events, including inside a same-origin iframe", async () => {
     let snap = await snapshot();
-    const result = await call("browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
+    const result = await call("browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/), snapshot: true });
     expect(result.text).toContain('button "Clicked 1x"');
     snap = await snapshot();
     await call("browser_click", { element: "Frame button", ref: ref(snap, /button "Frame button"/) });
@@ -198,6 +199,7 @@ describe("Browser MCP Plus extension end to end", () => {
       element: "Document",
       ref: ref(snap, /button "Document" \[file-input/),
       paths: [a, b],
+      snapshot: true,
     });
     expect(result.isError, result.text).toBeFalsy();
     expect(await domText("#files")).toBe("report.pdf:5,photo.png:7");
@@ -318,5 +320,184 @@ describe("Browser MCP Plus extension end to end", () => {
     const closedOther = await call("browser_tab_close", { tabId: secondId });
     expect(closedOther.text).toBe(`Closed tab ${secondId}`);
     expect((await call("browser_tab_list")).text.split("\n")).toHaveLength(1);
+  });
+
+  it("keeps the working tab when a restricted page can't be controlled", async () => {
+    const before = (await call("browser_tab_list")).text;
+    const workingId = Number(/\[(\d+)\][^\n]*\(connected/.exec(before)![1]);
+    const blocked = await call("browser_tab_new", { url: "chrome://version" });
+    expect(blocked.isError).toBe(true);
+    const list = (await call("browser_tab_list")).text;
+    expect(/\[(\d+)\][^\n]*\(connected/.exec(list)![1]).toBe(String(workingId));
+    const restrictedId = Number(/\[(\d+)\][^\n]*chrome:\/\/version/.exec(list)![1]);
+    // Tab commands still work and the snapshot still comes from the working tab.
+    expect((await call("browser_tab_select", { tabId: workingId })).isError).toBeFalsy();
+    expect((await call("browser_tab_close", { tabId: restrictedId })).text).toBe(`Closed tab ${restrictedId}`);
+    expect(await snapshot()).toContain("Fixture form");
+  });
+
+  describe("robustness", () => {
+    const status = () => domText("#status");
+    let snap = "";
+
+    beforeAll(async () => {
+      // Playwright auto-dismisses dialogs unless someone listens; a no-op listener
+      // leaves them open like in a normal browser.
+      page.on("dialog", () => {});
+      await call("browser_navigate", { url: `${siteUrl}/actions.html`, snapshot: false });
+    });
+
+    beforeEach(async () => {
+      snap = await snapshot();
+    });
+
+    it("reports a confirm dialog instead of hanging, then accepts or dismisses it", async () => {
+      const started = Date.now();
+      const clicked = await call("browser_click", { element: "Delete", ref: ref(snap, /button "Delete"/) });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(clicked.isError, clicked.text).toBeFalsy();
+      expect(clicked.text).toContain('A JavaScript confirm dialog is open: "Delete item?"');
+
+      // While the dialog is open other page tools explain what to do.
+      const blocked = await call("browser_snapshot");
+      expect(blocked.isError).toBe(true);
+      expect(blocked.text).toContain("browser_handle_dialog");
+
+      const accepted = await call("browser_handle_dialog", { accept: true });
+      expect(accepted.text).toContain('Accepted the confirm dialog "Delete item?"');
+      expect(await status()).toBe("Deleted");
+
+      await call("browser_click", { element: "Delete", ref: ref(snap, /button "Delete"/) });
+      await call("browser_handle_dialog", { accept: false });
+      expect(await status()).toBe("Kept");
+    });
+
+    it("handles alert and prompt dialogs", async () => {
+      await call("browser_click", { element: "Save", ref: ref(snap, /button "Save"/) });
+      await call("browser_handle_dialog", { accept: true });
+      expect(await status()).toBe("Alerted");
+
+      const asked = await call("browser_click", { element: "Ask name", ref: ref(snap, /button "Ask name"/) });
+      expect(asked.text).toContain("prompt dialog");
+      await call("browser_handle_dialog", { accept: true, promptText: "Ada" });
+      expect(await status()).toBe("Hello Ada");
+    });
+
+    it("refuses to click a covered element and names what covers it", async () => {
+      const result = await call("browser_click", { element: "Buy now", ref: ref(snap, /button "Buy now"/) });
+      expect(result.isError).toBe(true);
+      expect(result.text).toMatch(/covered by button "Accept cookies" \[ref=e\d+\] inside dialog "Cookie consent" \[ref=e\d+\]/);
+      expect(await status()).not.toBe("Covered clicked");
+
+      await call("browser_click", { element: "Accept cookies", ref: ref(snap, /button "Accept cookies"/) });
+      await call("browser_click", { element: "Buy now", ref: ref(snap, /button "Buy now"/) });
+      expect(await status()).toBe("Covered clicked");
+    });
+
+    it("refuses to click a disabled element", async () => {
+      const result = await call("browser_click", { element: "Disabled", ref: ref(snap, /button "Disabled action"/) });
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain("is disabled");
+    });
+
+    it("names icon-only buttons", async () => {
+      expect(snap).toMatch(/button "Settings" \[ref=/);
+      expect(snap).toMatch(/button "Search" \[ref=/);
+      await call("browser_click", { element: "Search", ref: ref(snap, /button "Search"/) });
+      expect(await status()).toBe("Search opened");
+    });
+
+    it("reports tabs opened by a click", async () => {
+      const result = await call("browser_click", { element: "Help", ref: ref(snap, /link "Open help in new tab"/) });
+      expect(result.text).toMatch(/New tab opened: \[(\d+)\]/);
+      const newId = Number(/New tab opened: \[(\d+)\]/.exec(result.text)![1]);
+      // Still connected to the original tab.
+      expect(result.text).toContain("- Page Title: Fixture actions");
+      await call("browser_tab_close", { tabId: newId });
+    });
+
+    it("does not report a delayed navigation as a failed click", async () => {
+      const result = await call("browser_click", { element: "Delayed login", ref: ref(snap, /button "Delayed login"/) });
+      expect(result.isError, result.text).toBeFalsy();
+      const waited = await call("browser_wait_for", { text: "Async content ready", timeout: 5 });
+      expect(waited.isError, waited.text).toBeFalsy();
+      expect(waited.text).toContain("- Page Title: Second page");
+      await call("browser_navigate", { url: `${siteUrl}/actions.html`, snapshot: false });
+    });
+
+    it("fills a whole form in one call", async () => {
+      const result = await call("browser_fill_form", {
+        fields: [
+          { name: "Full name", type: "textbox", ref: ref(snap, /textbox "Full name"/), value: "Ada Lovelace" },
+          { name: "Birthday", type: "textbox", ref: ref(snap, /textbox "Birthday"/), value: "1815-12-10" },
+          { name: "Newsletter", type: "checkbox", ref: ref(snap, /checkbox "Newsletter"/), value: "false" },
+          { name: "I agree", type: "checkbox", ref: ref(snap, /checkbox "I agree"/), value: "true" },
+          { name: "Pro", type: "radio", ref: ref(snap, /radio "Pro"/), value: "true" },
+          { name: "Size", type: "combobox", ref: ref(snap, /combobox "Size"/), value: "Large" },
+          { name: "Volume", type: "slider", ref: ref(snap, /slider "Volume"/), value: "7" },
+        ],
+      });
+      expect(result.isError, result.text).toBeFalsy();
+      expect(result.text).toContain("Filled 7 fields");
+      expect(await page.inputValue("#name")).toBe("Ada Lovelace");
+      expect(await page.inputValue("#birthday")).toBe("1815-12-10");
+      expect(await page.isChecked("#news")).toBe(false);
+      expect(await page.isChecked("#agree")).toBe(true);
+      expect(await page.isChecked("#pro")).toBe(true);
+      expect(await page.inputValue("#size")).toBe("Large");
+      expect(await page.inputValue("#volume")).toBe("7");
+    });
+
+    it("reports which field failed", async () => {
+      const result = await call("browser_fill_form", {
+        fields: [
+          { name: "Full name", type: "textbox", ref: ref(snap, /textbox "Full name"/), value: "Grace" },
+          { name: "Ghost", type: "textbox", ref: "e999999", value: "x" },
+        ],
+      });
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain('Field "Ghost" failed');
+      expect(result.text).toContain("Filled so far: Full name");
+    });
+
+    it("types into masked inputs key by key and reports the resulting value", async () => {
+      const result = await call("browser_type", {
+        element: "Phone",
+        ref: ref(snap, /textbox "Phone"/),
+        text: "5551234567",
+        slowly: true,
+      });
+      expect(await page.inputValue("#phone")).toBe("(555) 123-4567");
+      expect(result.text).toContain('the field now contains "(555) 123-4567"');
+    });
+
+    it("explains pages extensions cannot read", async () => {
+      const opened = await call("browser_tab_new", {});
+      expect(opened.isError).toBeFalsy();
+      expect(opened.text).toContain("can't be read or controlled by extensions");
+      const read = await call("browser_snapshot");
+      expect(read.isError).toBe(true);
+      expect(read.text).toContain("Navigate to a website first");
+      const tabs = (await call("browser_tab_list")).text;
+      const blankId = Number(/\[(\d+)\][^\n]*\(connected/.exec(tabs)![1]);
+      // Closing the connected tab hands the session to another tab instead of dropping it.
+      const closed = await call("browser_tab_close", { tabId: blankId });
+      expect(closed.text).toContain(`Closed tab ${blankId}; now connected to tab`);
+      expect(await snapshot()).toContain("Fixture actions");
+    });
+
+    it("navigates away from a page the debugger cannot control", async () => {
+      const restricted = await call("browser_navigate", { url: "chrome://version", snapshot: false });
+      expect(restricted.isError, restricted.text).toBeFalsy();
+      const back = await call("browser_navigate", { url: `${siteUrl}/actions.html` });
+      expect(back.isError, back.text).toBeFalsy();
+      expect(back.text).toContain("- Page Title: Fixture actions");
+    });
+
+    it("keeps action replies short", async () => {
+      const result = await call("browser_click", { element: "Search", ref: ref(snap, /button "Search"/) });
+      expect(result.text.length).toBeLessThan(300);
+      expect(result.text).not.toContain("Page Snapshot");
+    });
   });
 });

@@ -11,6 +11,10 @@ const DEFAULT_PORT = 9009;
 const RECONNECT_MS = 1_000;
 const KEEPALIVE_MS = 20_000;
 const MAX_CONSOLE_ENTRIES = 1_000;
+/** Below the server's 30 s request timeout, so a stuck request never blocks the queue. */
+const REQUEST_TIMEOUT_MS = 25_000;
+/** Cap on waiting for a page to load; slow trackers must not fail navigation. */
+const NAVIGATION_TIMEOUT_MS = 15_000;
 const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
 
 /** Messages beyond the original extension protocol; announced in `hello`. */
@@ -22,6 +26,8 @@ const CAPABILITIES = [
   "browser_tab_new",
   "browser_tab_select",
   "browser_tab_close",
+  "browser_handle_dialog",
+  "browser_fill_form",
 ];
 
 const state = {
@@ -32,6 +38,12 @@ const state = {
   /** tabId -> Map(contextId -> context) from Runtime.executionContextCreated. */
   contexts: new Map(),
   consoleLogs: [],
+  /** Open JavaScript dialog (alert/confirm/prompt/beforeunload) on the connected tab. */
+  dialog: null,
+  /** Tabs opened by the connected tab during the current action. */
+  newTabs: [],
+  /** tabId -> main frame id, to tell top-level navigations from iframe ones. */
+  mainFrames: new Map(),
   restored: false,
 };
 
@@ -82,14 +94,18 @@ async function disconnect() {
 
 async function selectTab(tabId) {
   const tab = await chrome.tabs.get(tabId);
+  // Attach first: a tab we can't debug (chrome://, Web Store) must not replace a working one.
+  await attachDebugger(tabId);
   if (state.tabId !== null && state.tabId !== tabId) {
     setBadge(state.tabId, false);
     await detach(state.tabId);
   }
   state.tabId = tabId;
   state.consoleLogs = [];
+  state.dialog = null;
   await chrome.storage.session.set({ tabId });
-  await ensureAttached(tabId);
+  // Enable the runtime only now so its replayed console entries are kept for this tab.
+  if (!state.attached.has(tabId)) await enableRuntime(tabId);
   setBadge(tabId, true);
   return tab;
 }
@@ -166,8 +182,13 @@ async function onServerMessage(ws, data) {
   }
   if (!message || typeof message.id !== "string" || typeof message.type !== "string") return;
 
-  // Run requests one at a time so input events never interleave.
-  const run = queue.then(() => handle(message.type, message.payload ?? {}));
+  // Run requests one at a time so input events never interleave, and give
+  // each a deadline so one that hangs cannot block everything queued after it.
+  const timeoutMs =
+    message.type === "browser_wait"
+      ? (Number(message.payload?.time) || 0) * 1000 + REQUEST_TIMEOUT_MS
+      : REQUEST_TIMEOUT_MS;
+  const run = queue.then(() => withTimeout(handle(message.type, message.payload ?? {}), timeoutMs, message.type));
   queue = run.catch(() => {});
   let response;
   try {
@@ -176,6 +197,14 @@ async function onServerMessage(ws, data) {
     response = { requestId: message.id, error: errorMessage(error) };
   }
   send(ws, { type: "messageResponse", payload: response });
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`"${label}" did not finish within ${ms / 1000} s`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 function errorMessage(error) {
@@ -199,6 +228,13 @@ function cdp(tabId, method, params = {}) {
 
 async function ensureAttached(tabId) {
   if (state.attached.has(tabId)) return;
+  await attachDebugger(tabId);
+  await enableRuntime(tabId);
+}
+
+// Fails for tabs Chrome won't let us debug (chrome://, Web Store) or that DevTools holds.
+async function attachDebugger(tabId) {
+  if (state.attached.has(tabId)) return;
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
   } catch (error) {
@@ -216,14 +252,22 @@ async function ensureAttached(tabId) {
       );
     }
   }
+}
+
+async function enableRuntime(tabId) {
   state.attached.add(tabId);
   state.contexts.set(tabId, new Map());
   await cdp(tabId, "Runtime.enable");
+  // Page events: JavaScript dialogs, navigation start/finish, main frame id.
+  await cdp(tabId, "Page.enable");
+  const { frameTree } = await cdp(tabId, "Page.getFrameTree");
+  state.mainFrames.set(tabId, frameTree.frame.id);
 }
 
 async function detach(tabId) {
   state.attached.delete(tabId);
   state.contexts.delete(tabId);
+  state.mainFrames.delete(tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
@@ -261,8 +305,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     else if (method === "Runtime.executionContextsCleared") contexts.clear();
   }
 
+  if (method === "Page.frameNavigated" && !params.frame.parentId) state.mainFrames.set(tabId, params.frame.id);
+
   if (tabId !== state.tabId) return;
-  if (method === "Runtime.consoleAPICalled") {
+  if (method === "Page.javascriptDialogOpening") {
+    state.dialog = { type: params.type, message: params.message, defaultPrompt: params.defaultPrompt };
+    for (const notify of dialogWaiters) notify();
+    dialogWaiters.clear();
+  } else if (method === "Page.javascriptDialogClosed") {
+    state.dialog = null;
+  } else if (method === "Runtime.consoleAPICalled") {
     pushLog({
       type: params.type,
       timestamp: params.timestamp,
@@ -305,15 +357,182 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === state.tabId) void disconnect();
 });
 
+chrome.tabs.onCreated.addListener((tab) => {
+  if (state.tabId !== null && tab.openerTabId === state.tabId) state.newTabs.push(tab.id);
+});
+
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (tabId === state.tabId && info.status === "loading") state.consoleLogs = [];
 });
 
 // ---------------------------------------------------------------------------
+// Dialogs and navigation tracking
+
+const dialogWaiters = new Set();
+
+/** Resolves when a JavaScript dialog opens on the connected tab. */
+function whenDialogOpens() {
+  let notify;
+  const promise = new Promise((resolve) => {
+    notify = resolve;
+    dialogWaiters.add(resolve);
+  });
+  return { promise, cancel: () => dialogWaiters.delete(notify) };
+}
+
+function dialogError() {
+  const { type, message } = state.dialog;
+  return new Error(
+    `A JavaScript ${type} dialog is open: ${JSON.stringify(message)}. The page is blocked until you call browser_handle_dialog to accept or dismiss it.`,
+  );
+}
+
+const NAVIGATION_START = new Set([
+  "Page.frameRequestedNavigation",
+  "Page.frameStartedLoading",
+  "Page.frameStartedNavigating",
+  "Page.frameNavigated",
+]);
+const NAVIGATION_END = new Set([
+  "Page.domContentEventFired",
+  "Page.loadEventFired",
+  "Page.frameStoppedLoading",
+  "Page.downloadWillBegin",
+]);
+
+/** Watches the tab's main frame for a navigation starting and its document becoming ready. */
+function trackNavigation(tabId) {
+  const tracker = { started: false };
+  let markStarted;
+  let markDone;
+  let markLoaded;
+  tracker.whenStarted = new Promise((resolve) => (markStarted = resolve));
+  tracker.whenDone = new Promise((resolve) => (markDone = resolve));
+  tracker.whenLoaded = new Promise((resolve) => (markLoaded = resolve));
+  const listener = (source, method, params) => {
+    if (source.tabId !== tabId) return;
+    // Only top-level navigations count; DOMContentLoaded/load are main-frame events already.
+    const isMainFrame =
+      method === "Page.frameNavigated"
+        ? !params.frame.parentId
+        : params?.frameId === undefined || params.frameId === state.mainFrames.get(tabId);
+    if (!isMainFrame) return;
+    if (NAVIGATION_START.has(method)) {
+      if (method === "Page.frameStartedNavigating" && /sameDocument/i.test(params.navigationType ?? "")) return;
+      tracker.started = true;
+      markStarted();
+    } else if (NAVIGATION_END.has(method) && tracker.started) {
+      markDone();
+      if (method !== "Page.domContentEventFired") markLoaded();
+    }
+  };
+  chrome.debugger.onEvent.addListener(listener);
+  tracker.stop = () => chrome.debugger.onEvent.removeListener(listener);
+  return tracker;
+}
+
+/** Grace period for the load event after DOMContentLoaded: scripts often reshape the page by then. */
+const LOAD_GRACE_MS = 1_500;
+
+/**
+ * Waits until the tab has a usable document: DOMContentLoaded, then the load
+ * event for at most LOAD_GRACE_MS, so slow third-party resources never stall
+ * the agent. Polls the tab status as a fallback for untracked navigations.
+ */
+async function waitForDocument(tabId, tracker) {
+  const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
+  let done = false;
+  tracker?.whenDone.then(() => (done = true));
+  await sleep(50);
+  while (!done && Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.status === "complete") return;
+    await sleep(100);
+  }
+  if (tracker) await Promise.race([tracker.whenLoaded, sleep(LOAD_GRACE_MS)]);
+}
+
+/**
+ * Runs a page action, then lets the page react: follows a navigation the
+ * action started, otherwise waits briefly for the DOM to settle. A dialog
+ * opened by the action ends the wait (the page is blocked until it is
+ * handled). Returns a report of what happened.
+ */
+async function runAction(tabId, action, { startWindowMs = 80, allowDialog = false } = {}) {
+  if (state.dialog && !allowDialog) throw dialogError();
+  state.newTabs = [];
+  const tracker = trackNavigation(tabId);
+  const dialog = whenDialogOpens();
+  try {
+    const work = (async () => {
+      const value = await action();
+      if (state.dialog) return value;
+      const quiet = callAgent("settle", 60, 1_500).catch(() => {});
+      await Promise.race([tracker.whenStarted, sleep(startWindowMs)]);
+      if (!tracker.started) await quiet;
+      if (tracker.started) {
+        await waitForDocument(tabId, tracker);
+        await callAgent("settle", 60, 1_000).catch(() => {});
+      }
+      return value;
+    })();
+    work.catch(() => {}); // keeps running in the background if a dialog interrupts it
+    const value = await Promise.race([work, dialog.promise.then(() => undefined)]);
+    return await actionReport(tabId, tracker, value);
+  } finally {
+    tracker.stop();
+    dialog.cancel();
+  }
+}
+
+async function actionReport(tabId, tracker, value) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const report = { url: tab?.url ?? "", title: tab?.title ?? "", navigated: tracker.started };
+  if (state.dialog) report.dialog = { ...state.dialog };
+  if (state.newTabs.length) {
+    const tabs = await Promise.all(state.newTabs.map((id) => chrome.tabs.get(id).then(tabInfo, () => null)));
+    report.newTabs = tabs.filter(Boolean);
+  }
+  if (value !== undefined) report.value = value;
+  return report;
+}
+
+// ---------------------------------------------------------------------------
 // Page agent
 
+const NAVIGATION_ERROR = /removed|No frame|Frame with ID|did not respond|navigat|context was destroyed/i;
+
+/** Calls the page agent; blocked by an open dialog, retried once if the page was navigating. */
 async function callAgent(method, ...args) {
   const tabId = requireTab();
+  if (state.dialog) throw dialogError();
+  const dialog = whenDialogOpens();
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await Promise.race([
+          runAgent(tabId, method, args),
+          dialog.promise.then(() => {
+            throw dialogError();
+          }),
+        ]);
+      } catch (error) {
+        const message = errorMessage(error);
+        const blocked = /Cannot access (contents of )?(url|the page)|cannot be scripted/i.exec(message);
+        if (blocked) {
+          const { url } = await chrome.tabs.get(tabId);
+          throw new Error(`This page (${url}) can't be read or controlled by extensions. Navigate to a website first.`);
+        }
+        if (attempt > 0 || state.dialog || !NAVIGATION_ERROR.test(message)) throw error;
+        await waitForDocument(tabId);
+      }
+    }
+  } finally {
+    dialog.cancel();
+  }
+}
+
+async function runAgent(tabId, method, args) {
   const run = () =>
     chrome.scripting.executeScript({
       target: { tabId },
@@ -427,21 +646,62 @@ async function drag(tabId, from, to) {
   }
 }
 
-async function waitForLoad(tabId, { timeoutMs = 30_000, graceMs = 1_000 } = {}) {
-  const started = Date.now();
-  let sawLoading = false;
-  while (Date.now() - started < timeoutMs) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "loading") sawLoading = true;
-    else if (sawLoading || Date.now() - started > graceMs) return;
-    await sleep(100);
+/** Types into a field the way a user would: click to focus, select the old content, then type. */
+async function typeInto(tabId, ref, text, { submit = false, slowly = false } = {}) {
+  const kind = await callAgent("editKind", ref);
+  if (kind === "direct") {
+    // Date, time, colour and range inputs cannot be typed into reliably.
+    await callAgent("setValue", ref, text);
+  } else {
+    try {
+      await mouseClick(tabId, await callAgent("point", ref));
+    } catch (error) {
+      // A floating label or similar overlay: focusing programmatically is fine for typing.
+      if (!/covered by/.test(errorMessage(error))) throw error;
+    }
+    const hadContent = await callAgent("selectContent", ref);
+    if (!text) {
+      if (hadContent) await pressKey(tabId, "Backspace");
+    } else if (slowly) {
+      // Key by key, for inputs that format as you type (phone, card, date masks).
+      if (hadContent) await pressKey(tabId, "Backspace");
+      for (const char of text) await pressKey(tabId, char === "\n" ? "Enter" : char);
+    } else {
+      await cdp(tabId, "Input.insertText", { text });
+    }
   }
+  const value = await callAgent("fieldValue", ref).catch(() => undefined);
+  if (submit) await pressKey(tabId, "Enter");
+  return value;
 }
 
-/** Lets the page react to an action: follow a navigation it triggered, then wait for DOM quiet. */
-async function afterAction(tabId) {
-  await waitForLoad(tabId, { graceMs: 200 });
-  await callAgent("settle", 100, 1_000).catch(() => {});
+async function fillField(tabId, { name, type, ref, value }) {
+  switch (type) {
+    case "textbox":
+    case "searchbox":
+    case "spinbutton":
+      return `${name}: ${JSON.stringify(await typeInto(tabId, ref, value))}`;
+    case "checkbox":
+    case "radio":
+    case "switch": {
+      const want = value === "true";
+      if (type === "radio" && !want) return `${name}: unchanged (a radio button is cleared by selecting another one)`;
+      if ((await callAgent("isChecked", ref)) !== want) await mouseClick(tabId, await callAgent("point", ref));
+      if ((await callAgent("isChecked", ref)) !== want) throw new Error(`could not ${want ? "check" : "uncheck"} it`);
+      return `${name}: ${want ? "checked" : "unchecked"}`;
+    }
+    case "combobox":
+    case "listbox": {
+      if (!(await callAgent("isNativeSelect", ref))) {
+        throw new Error("not a native <select>; open it with browser_click and click the option instead");
+      }
+      return `${name}: ${(await callAgent("selectOptions", ref, [value])).join(", ")}`;
+    }
+    case "slider":
+      return `${name}: ${await callAgent("setValue", ref, value)}`;
+    default:
+      throw new Error(`unsupported field type "${type}"`);
+  }
 }
 
 function requireTab() {
@@ -476,69 +736,78 @@ const handlers = {
   },
   async browser_snapshot() {
     requireTab();
+    if (state.dialog) throw dialogError();
     return callAgent("snapshot");
   },
   async browser_navigate({ url }) {
     const tabId = requireTab();
-    await chrome.tabs.update(tabId, { url });
-    await waitForLoad(tabId);
+    const attached = await ensureAttached(tabId).then(
+      () => true,
+      () => false,
+    );
+    if (!attached) {
+      // The current page can't be debugged (chrome://, Web Store): navigate without CDP.
+      await chrome.tabs.update(tabId, { url });
+      await waitForDocument(tabId);
+      return actionReport(tabId, { started: true }, undefined);
+    }
+    return runAction(
+      tabId,
+      async () => {
+        const result = await cdp(tabId, "Page.navigate", { url }).catch(() => null);
+        if (!result) {
+          await chrome.tabs.update(tabId, { url });
+        } else if (result.errorText && result.errorText !== "net::ERR_ABORTED") {
+          throw new Error(`Could not open ${url}: ${result.errorText}`);
+        }
+      },
+      { startWindowMs: 1_000 },
+    );
   },
   async browser_go_back() {
     const tabId = requireTab();
-    await chrome.tabs.goBack(tabId);
-    await waitForLoad(tabId);
+    return runAction(tabId, () => chrome.tabs.goBack(tabId), { startWindowMs: 1_000 });
   },
   async browser_go_forward() {
     const tabId = requireTab();
-    await chrome.tabs.goForward(tabId);
-    await waitForLoad(tabId);
+    return runAction(tabId, () => chrome.tabs.goForward(tabId), { startWindowMs: 1_000 });
   },
   async browser_wait({ time }) {
     await sleep(Math.max(0, Number(time) || 0) * 1000);
   },
   async browser_press_key({ key }) {
     const tabId = requireTab();
-    await pressKey(tabId, key);
-    await afterAction(tabId);
+    return runAction(tabId, () => pressKey(tabId, key));
   },
   async browser_click({ ref }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    await mouseClick(tabId, await callAgent("point", ref));
-    await afterAction(tabId);
+    return runAction(tabId, async () => mouseClick(tabId, await callAgent("point", ref)));
   },
   async browser_hover({ ref }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    const { x, y } = await callAgent("point", ref);
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await afterAction(tabId);
+    return runAction(tabId, async () => {
+      const { x, y } = await callAgent("point", ref, false);
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    });
   },
   async browser_drag({ startRef, endRef }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    const { from, to } = await callAgent("dragPoints", startRef, endRef);
-    await drag(tabId, from, to);
-    await afterAction(tabId);
+    return runAction(tabId, async () => {
+      const { from, to } = await callAgent("dragPoints", startRef, endRef);
+      await drag(tabId, from, to);
+    });
   },
-  async browser_type({ ref, text, submit }) {
+  async browser_type({ ref, text, submit, slowly }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    await callAgent("prepareTyping", ref);
-    if (text) await cdp(tabId, "Input.insertText", { text });
-    else await pressKey(tabId, "Backspace");
-    if (submit) await pressKey(tabId, "Enter");
-    await afterAction(tabId);
+    return runAction(tabId, () => typeInto(tabId, ref, text, { submit, slowly }));
   },
   async browser_select_option({ ref, values }) {
     const tabId = requireTab();
-    const selected = await callAgent("selectOptions", ref, values);
-    await afterAction(tabId);
-    return selected;
+    return runAction(tabId, () => callAgent("selectOptions", ref, values));
   },
   async browser_screenshot() {
     const tabId = requireTab();
-    await ensureAttached(tabId);
+    if (state.dialog) throw dialogError();
     const { data } = await cdp(tabId, "Page.captureScreenshot", { format: "png" });
     return data;
   },
@@ -551,35 +820,43 @@ const handlers = {
 
   async browser_upload_file({ ref, paths }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    if (await callAgent("isFileInput", ref)) {
-      const objectId = await resolveRef(ref);
-      await cdp(tabId, "DOM.setFileInputFiles", { files: paths, objectId });
-    } else {
-      // A button that opens a file chooser: intercept the dialog instead of showing it.
-      await cdp(tabId, "Page.enable");
-      await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
-      try {
-        const opened = waitForEvent(tabId, "Page.fileChooserOpened", 5_000);
-        await mouseClick(tabId, await callAgent("point", ref));
-        const chooser = await opened.catch(() => {
-          throw new Error("Clicking the element did not open a file chooser. Use the file input itself or the button that opens the chooser.");
-        });
-        if (chooser.mode === "selectSingle" && paths.length > 1) {
-          throw new Error("This file chooser accepts a single file.");
+    return runAction(tabId, () => uploadFiles(tabId, ref, paths));
+  },
+
+  async browser_handle_dialog({ accept, promptText }) {
+    const tabId = requireTab();
+    if (!state.dialog) throw new Error("No dialog is open.");
+    const { type, message } = state.dialog;
+    return runAction(
+      tabId,
+      async () => {
+        await cdp(tabId, "Page.handleJavaScriptDialog", { accept, ...(promptText === undefined ? {} : { promptText }) });
+        state.dialog = null;
+        return `${accept ? "Accepted" : "Dismissed"} the ${type} dialog ${JSON.stringify(message)}`;
+      },
+      { allowDialog: true, startWindowMs: 300 },
+    );
+  },
+
+  async browser_fill_form({ fields }) {
+    const tabId = requireTab();
+    return runAction(tabId, async () => {
+      const done = [];
+      for (const field of fields) {
+        try {
+          done.push(await fillField(tabId, field));
+        } catch (error) {
+          const filled = done.length ? ` Filled so far: ${done.join("; ")}.` : "";
+          throw new Error(`Field "${field.name}" failed: ${errorMessage(error)}.${filled}`);
         }
-        if (!chooser.backendNodeId) throw new Error("The file chooser is not backed by a file input.");
-        await cdp(tabId, "DOM.setFileInputFiles", { files: paths, backendNodeId: chooser.backendNodeId });
-      } finally {
-        await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
       }
-    }
-    await afterAction(tabId);
+      return done;
+    });
   },
 
   async browser_evaluate({ function: source, ref }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
+    if (state.dialog) throw dialogError();
     const options = { awaitPromise: true, returnByValue: true, userGesture: true };
     let response;
     if (ref) {
@@ -603,20 +880,14 @@ const handlers = {
 
   async browser_scroll({ ref, deltaX = 0, deltaY = 0 }) {
     const tabId = requireTab();
-    await ensureAttached(tabId);
-    if (ref) {
-      await callAgent("scrollIntoView", ref);
-    } else {
+    return runAction(tabId, async () => {
+      if (ref) {
+        await callAgent("scrollIntoView", ref);
+        return;
+      }
       const { width, height } = await callAgent("viewport");
-      await cdp(tabId, "Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x: width / 2,
-        y: height / 2,
-        deltaX,
-        deltaY,
-      });
-    }
-    await afterAction(tabId);
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: width / 2, y: height / 2, deltaX, deltaY });
+    });
   },
 
   async browser_tab_list() {
@@ -627,7 +898,7 @@ const handlers = {
   async browser_tab_new({ url }) {
     const created = await chrome.tabs.create({ url: url || "about:blank", active: true });
     await selectTab(created.id);
-    if (url) await waitForLoad(created.id);
+    if (url) await waitForDocument(created.id);
     return tabInfo(await chrome.tabs.get(created.id));
   },
 
@@ -641,29 +912,83 @@ const handlers = {
   async browser_tab_close({ tabId }) {
     const target = tabId ?? requireTab();
     const tab = await chrome.tabs.get(target);
-    const wasConnected = target === state.tabId;
-    if (wasConnected) {
-      // Keep the session alive: hand control to the tab that becomes active.
-      setBadge(target, false);
-      await detach(target);
+    if (target !== state.tabId) {
+      await chrome.tabs.remove(target);
+      return null;
     }
+    // Keep the session alive: move to another tab *before* closing this one,
+    // otherwise the tab-removed handler sees the connected tab go and disconnects.
+    const next = await switchAwayFrom(target, tab.windowId);
     await chrome.tabs.remove(target);
-    if (!wasConnected) return null;
-    const [next] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
     if (!next) {
       await disconnect();
       return null;
     }
-    await selectTab(next.id);
     return tabInfo(await chrome.tabs.get(next.id));
   },
 };
+
+/** Connects the most recently used other tab (same window first) and activates it. */
+async function switchAwayFrom(tabId, windowId) {
+  const others = (await chrome.tabs.query({})).filter((t) => t.id !== tabId);
+  others.sort(
+    (a, b) => Number(b.windowId === windowId) - Number(a.windowId === windowId) || (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0),
+  );
+  for (const candidate of others) {
+    try {
+      await selectTab(candidate.id);
+      await chrome.tabs.update(candidate.id, { active: true });
+      return candidate;
+    } catch {
+      // e.g. a chrome:// tab that cannot be debugged: try the next one.
+    }
+  }
+  return null;
+}
+
+async function uploadFiles(tabId, ref, paths) {
+  if (await callAgent("isFileInput", ref)) {
+    const objectId = await resolveRef(ref);
+    await cdp(tabId, "DOM.setFileInputFiles", { files: paths, objectId });
+    return;
+  }
+  // A button that opens a file chooser: intercept the dialog instead of showing it.
+  await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+  try {
+    const opened = waitForEvent(tabId, "Page.fileChooserOpened", 5_000);
+    await mouseClick(tabId, await callAgent("point", ref));
+    const chooser = await opened.catch(() => {
+      throw new Error("Clicking the element did not open a file chooser. Use the file input itself or the button that opens the chooser.");
+    });
+    if (chooser.mode === "selectSingle" && paths.length > 1) {
+      throw new Error("This file chooser accepts a single file.");
+    }
+    if (!chooser.backendNodeId) throw new Error("The file chooser is not backed by a file input.");
+    await cdp(tabId, "DOM.setFileInputFiles", { files: paths, backendNodeId: chooser.backendNodeId });
+  } finally {
+    await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+  }
+}
+
+/** Messages that work without the debugger, e.g. while the tab shows a chrome:// page. */
+const NO_DEBUGGER = new Set([
+  "getUrl",
+  "getTitle",
+  "browser_navigate",
+  "browser_wait",
+  "browser_get_console_logs",
+  "browser_tab_list",
+  "browser_tab_select",
+  "browser_tab_new",
+  "browser_tab_close",
+]);
 
 async function handle(type, payload) {
   await restore();
   const handler = handlers[type];
   if (!handler) throw new Error(`Unsupported message "${type}"`);
-  if (state.tabId !== null && type !== "browser_tab_list") await ensureAttached(state.tabId);
+  // Tab and navigation commands must work even when the connected tab can't be debugged.
+  if (state.tabId !== null && !NO_DEBUGGER.has(type)) await ensureAttached(state.tabId);
   return handler(payload);
 }
 

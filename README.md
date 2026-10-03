@@ -16,6 +16,9 @@ and stays compatible with its extension. [Türkçe README](README.tr.md)
 | | Browser MCP | browsermcp-plus |
 | --- | --- | --- |
 | File upload | ✗ | ✓ file inputs *and* "choose file" buttons, no OS dialog |
+| `alert` / `confirm` dialogs | freeze the extension | reported and handled |
+| Tokens per click on a large page | whole page (~14k on Wikipedia) | short report (~30) |
+| Forms | one call per field | `browser_fill_form` |
 | Run JavaScript, tabs, scrolling | ✗ | ✓ |
 | Extension source | closed | open source ([`extension/`](extension/)) |
 | Server reachable from the network | yes, all interfaces | loopback only |
@@ -72,13 +75,16 @@ Claude Code: `claude mcp add browser -- npx -y github:Novpix/browsermcp-plus`
 | --- | --- |
 | `browser_navigate` | Open a URL (`example.com` → `https://example.com`) |
 | `browser_go_back` / `browser_go_forward` / `browser_reload` | History and reload |
-| `browser_snapshot` | Accessibility snapshot with element refs |
+| `browser_snapshot` | Accessibility snapshot with element refs (optionally one subtree) |
+| `browser_find` | Find elements by text without loading the whole snapshot |
 | `browser_click` / `browser_hover` | Act on an element from the snapshot |
-| `browser_type` | Type into an element, optionally pressing Enter |
+| `browser_type` | Type into an element (key by key for masked inputs), optionally pressing Enter |
+| `browser_fill_form` | Fill many fields — text, checkboxes, radios, dropdowns, sliders, dates — in one call |
 | `browser_select_option` | Choose dropdown values |
 | `browser_drag` | Drag one element onto another (incl. HTML5 drag and drop) |
 | `browser_press_key` | Keys and shortcuts (`Enter`, `PageDown`, `Control+a`, …) |
 | `browser_file_upload` | Upload local files through a file input or a "choose file" button |
+| `browser_handle_dialog` | Accept or dismiss `alert` / `confirm` / `prompt` dialogs |
 | `browser_evaluate` | Run JavaScript in the page, optionally on a snapshot element |
 | `browser_scroll` | Scroll by pixels or scroll an element into view |
 | `browser_tab_list` / `_new` / `_select` / `_close` | Work across tabs |
@@ -86,9 +92,15 @@ Claude Code: `claude mcp add browser -- npx -y github:Novpix/browsermcp-plus`
 | `browser_get_console_logs` | Read the page console |
 | `browser_screenshot` | PNG of the visible viewport |
 
+Actions (click, type, …) answer with a short report — URL, title, whether a new
+page loaded, open dialogs, new tabs — instead of the whole page, which keeps
+agents fast and their context small. Pass `snapshot: true` when you want the
+page right away. Clicks on disabled or covered elements fail with an
+explanation instead of silently hitting the overlay.
+
 Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) so clients can
 skip confirmation for read-only ones. With the original Browser MCP extension
-everything except upload, evaluate, scroll and tabs works.
+everything except upload, forms, dialogs, evaluate, scroll and tabs works.
 
 ## Options
 
@@ -98,8 +110,8 @@ everything except upload, evaluate, scroll and tabs works.
 --no-takeover              don't ask a running server to hand over the port
 --kill-existing            terminate a non-cooperating process on the port
 --request-timeout <ms>     timeout for a single browser action (default 30000)
---snapshot-max-chars <n>   truncate large snapshots (0 = never, default)
---no-action-snapshots      don't append a snapshot to action results
+--snapshot-max-chars <n>   truncate large snapshots (default 80000, 0 = never)
+--action-snapshots         include the page snapshot in every action result
 --verbose                  debug logging on stderr
 ```
 

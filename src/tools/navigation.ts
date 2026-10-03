@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { actionResult } from "../snapshot";
-import { defineTool, NAVIGATION } from "./tool";
+import { defineTool, NAVIGATION, snapshotOption } from "./tool";
 
 export const navigate = defineTool({
   name: "browser_navigate",
@@ -9,46 +9,47 @@ export const navigate = defineTool({
     "Navigate the connected tab to a URL. A missing scheme defaults to https:// (http:// for localhost).",
   inputSchema: z.object({
     url: z.string().min(1).describe("The URL to navigate to"),
+    snapshot: snapshotOption("yes"),
   }),
   annotations: NAVIGATION,
-  handle: async (context, { url }) => {
+  handle: async (context, { url, snapshot = true }) => {
     const target = normalizeUrl(url);
-    await context.send("browser_navigate", { url: target });
-    return actionResult(context, `Navigated to ${target}`);
+    const result = await context.send("browser_navigate", { url: target });
+    return actionResult(context, `Navigated to ${target}`, result, { snapshot });
   },
 });
 
 export const goBack = defineTool({
   name: "browser_go_back",
   description: "Go back to the previous page",
-  inputSchema: z.object({}),
+  inputSchema: z.object({ snapshot: snapshotOption("yes") }),
   annotations: NAVIGATION,
-  handle: async (context) => {
-    await context.send("browser_go_back", {});
-    return actionResult(context, "Navigated back");
+  handle: async (context, { snapshot = true }) => {
+    const result = await context.send("browser_go_back", {});
+    return actionResult(context, "Navigated back", result, { snapshot });
   },
 });
 
 export const goForward = defineTool({
   name: "browser_go_forward",
   description: "Go forward to the next page",
-  inputSchema: z.object({}),
+  inputSchema: z.object({ snapshot: snapshotOption("yes") }),
   annotations: NAVIGATION,
-  handle: async (context) => {
-    await context.send("browser_go_forward", {});
-    return actionResult(context, "Navigated forward");
+  handle: async (context, { snapshot = true }) => {
+    const result = await context.send("browser_go_forward", {});
+    return actionResult(context, "Navigated forward", result, { snapshot });
   },
 });
 
 export const reload = defineTool({
   name: "browser_reload",
   description: "Reload the current page by navigating to its current URL",
-  inputSchema: z.object({}),
+  inputSchema: z.object({ snapshot: snapshotOption("yes") }),
   annotations: NAVIGATION,
-  handle: async (context) => {
+  handle: async (context, { snapshot = true }) => {
     const url = await context.send("getUrl", undefined);
-    await context.send("browser_navigate", { url });
-    return actionResult(context, `Reloaded ${url}`);
+    const result = await context.send("browser_navigate", { url });
+    return actionResult(context, `Reloaded ${url}`, result, { snapshot });
   },
 });
 
