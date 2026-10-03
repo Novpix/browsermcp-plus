@@ -3,7 +3,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Command, InvalidArgumentError } from "commander";
 
 import packageJSON from "../package.json";
-import { DEFAULT_ALLOWED_ORIGINS, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_WS_PORT } from "./config";
+import {
+  DEFAULT_ALLOWED_ORIGINS,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  DEFAULT_SNAPSHOT_MAX_CHARS,
+  DEFAULT_WS_PORT,
+} from "./config";
 import { log, setVerbose } from "./log";
 import { createServer } from "./server";
 
@@ -48,9 +53,13 @@ const program = new Command()
     "--snapshot-max-chars <n>",
     "truncate page snapshots longer than this (0 = never)",
     integer(0),
-    0,
+    DEFAULT_SNAPSHOT_MAX_CHARS,
   )
-  .option("--no-action-snapshots", "do not append a page snapshot to action results")
+  .option(
+    "--action-snapshots",
+    "append the page snapshot to every action result (default: only navigation does; actions return a short report)",
+    false,
+  )
   .option("--verbose", "log debug output to stderr", false);
 
 type CliOptions = {

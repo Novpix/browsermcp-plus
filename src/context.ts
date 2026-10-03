@@ -1,5 +1,10 @@
 import type { ExtensionBridge } from "./bridge";
-import { DEFAULT_CONNECT_WAIT_MS, DEFAULT_REQUEST_TIMEOUT_MS, REPOSITORY_URL } from "./config";
+import {
+  DEFAULT_CONNECT_WAIT_MS,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  DEFAULT_SNAPSHOT_MAX_CHARS,
+  REPOSITORY_URL,
+} from "./config";
 import { PLUS_MESSAGES, type MessageType, type Payload, type Result } from "./protocol";
 
 export type ContextOptions = {
@@ -9,7 +14,7 @@ export type ContextOptions = {
   connectWaitMs?: number;
   /** Truncate page snapshots longer than this many characters (0 = never). */
   snapshotMaxChars?: number;
-  /** Append a page snapshot to the result of every page action. */
+  /** Append a page snapshot to the result of every page action by default. */
   actionSnapshots?: boolean;
 };
 
@@ -26,8 +31,8 @@ export class Context {
   ) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.connectWaitMs = options.connectWaitMs ?? DEFAULT_CONNECT_WAIT_MS;
-    this.snapshotMaxChars = options.snapshotMaxChars ?? 0;
-    this.actionSnapshots = options.actionSnapshots ?? true;
+    this.snapshotMaxChars = options.snapshotMaxChars ?? DEFAULT_SNAPSHOT_MAX_CHARS;
+    this.actionSnapshots = options.actionSnapshots ?? false;
   }
 
   async send<T extends MessageType>(

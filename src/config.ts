@@ -32,6 +32,13 @@ export const DEFAULT_ALLOWED_ORIGINS = [EXTENSION_ORIGIN, PLUS_ORIGIN];
 /** Error string the extension returns when no tab has been connected. */
 export const EXTENSION_NO_TAB_ERROR = "No tab is connected";
 
+/**
+ * Snapshots longer than this are truncated (~20k tokens). MCP clients drop
+ * oversized tool results (Claude Code: 25k tokens); browser_find and
+ * browser_snapshot with a ref reach the rest.
+ */
+export const DEFAULT_SNAPSHOT_MAX_CHARS = 80_000;
+
 /** Default timeout for a single request to the extension. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 

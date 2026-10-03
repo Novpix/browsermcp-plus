@@ -1,7 +1,7 @@
-import { evaluate, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./plus";
+import { evaluate, fillForm, handleDialog, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./plus";
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
-import { getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
+import { find, getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
 import type { Tool } from "./tool";
 
 export const tools: Tool[] = [
@@ -10,6 +10,7 @@ export const tools: Tool[] = [
   goForward,
   reload,
   snapshot,
+  find,
   click,
   hover,
   type,
@@ -21,6 +22,8 @@ export const tools: Tool[] = [
   getConsoleLogs,
   screenshot,
   // Browser MCP Plus extension only.
+  fillForm,
+  handleDialog,
   uploadFile,
   evaluate,
   scroll,

@@ -1,15 +1,45 @@
 import { z } from "zod";
 
-import { formatSnapshot, readPageSnapshot, snapshotResult } from "../snapshot";
+import { findInSnapshot, formatSnapshot, readPageSnapshot, snapshotResult, snapshotSubtree } from "../snapshot";
 import { defineTool, READ_ONLY, text } from "./tool";
 
 export const snapshot = defineTool({
   name: "browser_snapshot",
   description:
-    "Capture accessibility snapshot of the current page. Use this for getting references to elements to interact with.",
-  inputSchema: z.object({}),
+    "Capture accessibility snapshot of the current page. Use this for getting references to elements to interact with. Pass a ref to see only that part of the page.",
+  inputSchema: z.object({
+    ref: z.string().min(1).optional().describe("Only return the subtree of this element"),
+  }),
   annotations: READ_ONLY,
-  handle: (context) => snapshotResult(context),
+  handle: async (context, { ref }) => {
+    if (!ref) return snapshotResult(context);
+    const page = await readPageSnapshot(context);
+    const subtree = snapshotSubtree(page.snapshot, ref);
+    if (subtree === undefined) {
+      throw new Error(`Element "${ref}" is not on the current page. Take a full snapshot first.`);
+    }
+    return text(formatSnapshot({ ...page, snapshot: subtree }, { maxChars: context.snapshotMaxChars }));
+  },
+});
+
+export const find = defineTool({
+  name: "browser_find",
+  description:
+    "Search the page snapshot for text (case-insensitive) and return only the matching elements with their refs and position in the page. Much smaller than a full snapshot.",
+  inputSchema: z.object({
+    text: z.string().min(1).describe("Text to look for in element names, values, text and URLs"),
+  }),
+  annotations: READ_ONLY,
+  handle: async (context, args) => {
+    const page = await readPageSnapshot(context);
+    const { text: found, matches } = findInSnapshot(page.snapshot, args.text);
+    const header = [`- Page URL: ${page.url}`, `- Page Title: ${page.title}`];
+    if (!matches) return text([...header, `No elements match ${JSON.stringify(args.text)}.`].join("\n"));
+    const shown = matches > 30 ? ` (showing the first 30 of ${matches})` : "";
+    return text(
+      [...header, `- ${matches} match${matches === 1 ? "" : "es"}${shown}`, "```yaml", found, "```"].join("\n"),
+    );
+  },
 });
 
 export const screenshot = defineTool({

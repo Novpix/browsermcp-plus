@@ -1,5 +1,5 @@
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
-import type { z } from "zod";
+import { z } from "zod";
 
 import type { Context } from "../context";
 
@@ -43,3 +43,12 @@ export function text(value: string): CallToolResult {
 export function preview(value: string, max = 80): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }
+
+/** Per-call override for including the page snapshot in an action's result. */
+export const snapshotOption = (defaultLabel: "no" | "yes") =>
+  z
+    .boolean()
+    .optional()
+    .describe(
+      `Also return the page snapshot after the action (default: ${defaultLabel}). Use it when you need to see the result right away.`,
+    );

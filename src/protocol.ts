@@ -16,20 +16,22 @@ export type ExtensionMessages = {
   getUrl: { payload: undefined; result: string };
   getTitle: { payload: undefined; result: string };
   browser_snapshot: { payload: Record<string, never>; result: string };
-  browser_navigate: { payload: { url: string }; result: unknown };
-  browser_go_back: { payload: Record<string, never>; result: unknown };
-  browser_go_forward: { payload: Record<string, never>; result: unknown };
+  // Page actions: the Plus extension answers with an ActionReport, the
+  // original extension with nothing.
+  browser_navigate: { payload: { url: string }; result: ActionResult };
+  browser_go_back: { payload: Record<string, never>; result: ActionResult };
+  browser_go_forward: { payload: Record<string, never>; result: ActionResult };
   browser_wait: { payload: { time: number }; result: unknown };
-  browser_press_key: { payload: { key: string }; result: unknown };
-  browser_click: { payload: ElementRef; result: unknown };
-  browser_hover: { payload: ElementRef; result: unknown };
+  browser_press_key: { payload: { key: string }; result: ActionResult };
+  browser_click: { payload: ElementRef; result: ActionResult };
+  browser_hover: { payload: ElementRef; result: ActionResult };
   browser_type: {
-    payload: ElementRef & { text: string; submit: boolean };
-    result: unknown;
+    payload: ElementRef & { text: string; submit: boolean; slowly?: boolean };
+    result: ActionResult;
   };
   browser_select_option: {
     payload: ElementRef & { values: string[] };
-    result: unknown;
+    result: ActionResult;
   };
   browser_drag: {
     payload: {
@@ -38,7 +40,7 @@ export type ExtensionMessages = {
       endElement: string;
       endRef: string;
     };
-    result: unknown;
+    result: ActionResult;
   };
   /** Base64 encoded PNG. */
   browser_screenshot: { payload: Record<string, never>; result: string };
@@ -48,20 +50,54 @@ export type ExtensionMessages = {
   };
 
   // Browser MCP Plus extension only (announced through `hello` capabilities).
-  browser_upload_file: { payload: ElementRef & { paths: string[] }; result: unknown };
+  browser_upload_file: { payload: ElementRef & { paths: string[] }; result: ActionResult };
   browser_evaluate: {
     payload: { function: string; ref?: string; element?: string };
     result: EvaluateResult;
   };
   browser_scroll: {
     payload: { ref?: string; element?: string; deltaX?: number; deltaY?: number };
-    result: unknown;
+    result: ActionResult;
   };
+  browser_handle_dialog: { payload: { accept: boolean; promptText?: string }; result: ActionResult };
+  browser_fill_form: { payload: { fields: FormField[] }; result: ActionResult };
   browser_tab_list: { payload: Record<string, never>; result: TabInfo[] };
   browser_tab_new: { payload: { url?: string }; result: TabInfo };
   browser_tab_select: { payload: { tabId: number }; result: TabInfo };
   browser_tab_close: { payload: { tabId?: number }; result: TabInfo | null };
 };
+
+/** What happened during a page action, reported by the Plus extension. */
+export type ActionReport = {
+  url: string;
+  title: string;
+  /** The action started a top-level navigation. */
+  navigated: boolean;
+  /** A JavaScript dialog is open and blocks the page. */
+  dialog?: { type: string; message: string; defaultPrompt?: string };
+  /** Tabs the page opened during the action (target=_blank, window.open). */
+  newTabs?: TabInfo[];
+  /** Action-specific outcome, e.g. a field's value after typing. */
+  value?: unknown;
+};
+
+export type ActionResult = ActionReport | undefined;
+
+export type FormField = {
+  name: string;
+  type: "textbox" | "searchbox" | "spinbutton" | "checkbox" | "radio" | "switch" | "combobox" | "listbox" | "slider";
+  ref: string;
+  value: string;
+};
+
+export function isActionReport(value: unknown): value is ActionReport {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as ActionReport).url === "string" &&
+    typeof (value as ActionReport).navigated === "boolean"
+  );
+}
 
 export type TabInfo = {
   id: number;
@@ -88,6 +124,8 @@ export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_tab_new",
   "browser_tab_select",
   "browser_tab_close",
+  "browser_handle_dialog",
+  "browser_fill_form",
 ]);
 
 /** Sent by the Browser MCP Plus extension right after connecting. */

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.4.0
+
+Faster, leaner and harder to get stuck. Measured against 0.3.0 with the same
+benchmark (real Chromium, fixture page and Wikipedia):
+
+| | 0.3.0 | 0.4.0 |
+| --- | --- | --- |
+| click / type / hover | ~308 ms | ~100 ms |
+| click result on Wikipedia | ~13,900 tokens | ~30 tokens |
+| filling a 5-field form | 5 tool calls | 1 call, ~170 ms |
+
+### Changed
+
+- Page actions return a short report (URL, title, whether a new page loaded,
+  dialogs, new tabs) instead of the full page snapshot. Pass `snapshot: true`
+  to any action, or start the server with `--action-snapshots`, to get it.
+  Navigation tools still include the snapshot by default.
+- Waiting after an action follows real navigation events instead of a fixed
+  300 ms: actions that don't navigate return as soon as the DOM settles.
+- Snapshots are truncated at 80,000 characters by default
+  (`--snapshot-max-chars`), below the size MCP clients drop.
+
+### Added
+
+- `browser_fill_form`: fill text fields, checkboxes, radios, native dropdowns,
+  sliders and date inputs in one call.
+- `browser_handle_dialog`: `alert`, `confirm`, `prompt` and `beforeunload`
+  dialogs are reported instead of freezing the extension.
+- `browser_find`: search the page for text and get only the matching elements
+  with their refs; `browser_snapshot` takes a `ref` to return one subtree.
+- `browser_type` reports what the field actually holds and has a `slowly`
+  option for masked inputs (phone, card, date).
+
+### Fixed
+
+- A click on an element covered by a banner or overlay, or on a disabled
+  element, reported success; it now fails and names what covers it.
+- A click whose page navigated a moment later could be reported as failed,
+  inviting a double submit.
+- Tabs opened by a click (`target=_blank`, `window.open`) went unnoticed.
+- Date, time, colour and range inputs could not be typed into; React-style
+  inputs got stale values.
+- Icon-only buttons had no name; a `<label>` wrapping a `<select>` included
+  the options in the field's name.
+- One stuck request (e.g. an unresolved promise) blocked every later request.
+- Pages that never finish loading (slow trackers) made navigation time out.
+- Closing the connected tab with `browser_tab_close` could drop the whole
+  connection; it now hands the session to the most recently used tab first.
+- Pages extensions cannot read (`about:blank`, `chrome://`) give a clear
+  message instead of Chrome's raw permission error.
+- The extension could not navigate away from pages it cannot debug
+  (`chrome://`, the Web Store), and selecting such a tab dropped the working
+  one.
+
 ## 0.3.0
 
 First release as **browsermcp-plus**, an independent project based on

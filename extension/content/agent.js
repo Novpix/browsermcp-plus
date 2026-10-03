@@ -63,6 +63,19 @@
     return clip(collapse(el.innerText ?? el.textContent), MAX_NAME);
   }
 
+  /** Text of a <label>, leaving out the control it wraps (e.g. a select's options). */
+  function labelText(label, control) {
+    if (!label.contains(control)) return textOf(label);
+    let text = "";
+    const walk = (node) => {
+      if (node === control) return;
+      if (node.nodeType === Node.TEXT_NODE) text += ` ${node.textContent}`;
+      else if (node.nodeType === Node.ELEMENT_NODE && !SKIPPED_TAGS.has(node.tagName)) node.childNodes.forEach(walk);
+    };
+    label.childNodes.forEach(walk);
+    return clip(collapse(text), MAX_NAME);
+  }
+
   function roleOf(el) {
     const explicit = el.getAttribute("role");
     if (explicit && explicit.trim() && !/^(none|presentation)$/.test(explicit.trim())) {
@@ -108,7 +121,7 @@
         return el.value || (el.type === "submit" ? "Submit" : el.type === "reset" ? "Reset" : "");
       }
       if (tag === "INPUT" && el.type === "image") return el.alt || el.value || "Submit";
-      const labels = el.labels ? [...el.labels].map(textOf).join(" ") : "";
+      const labels = el.labels ? [...el.labels].map((label) => labelText(label, el)).join(" ") : "";
       if (collapse(labels)) return clip(collapse(labels), MAX_NAME);
       return collapse(el.getAttribute("placeholder") || el.title);
     }
@@ -123,8 +136,19 @@
       if (caption) return textOf(caption);
     }
     if (tag === "IFRAME") return collapse(el.title || el.name);
-    if (NAME_FROM_CONTENT.has(role)) return textOf(el) || collapse(el.title);
+    if (NAME_FROM_CONTENT.has(role)) return textOf(el) || collapse(el.title) || nameFromDescendants(el);
     return collapse(el.title);
+  }
+
+  /** Icon-only buttons and links: use a labelled image or icon inside them. */
+  function nameFromDescendants(el) {
+    const labelled = el.querySelector("[aria-label], img[alt], svg title, [title]");
+    if (!labelled) return "";
+    if (labelled.tagName === "title") return clip(collapse(labelled.textContent), MAX_NAME);
+    return clip(
+      collapse(labelled.getAttribute("aria-label") || labelled.getAttribute("alt") || labelled.getAttribute("title")),
+      MAX_NAME,
+    );
   }
 
   function isHidden(el, style) {
@@ -349,10 +373,105 @@
     return el;
   }
 
-  /** Scrolls the element into view and returns its centre in top-level viewport coordinates. */
-  function point(ref) {
-    element(ref).scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    return centerOf(ref);
+  function nextFrame() {
+    // requestAnimationFrame stalls in background tabs, so cap the wait.
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, 50);
+      requestAnimationFrame(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  function boxOf(el) {
+    // Inline elements wrapping across lines have a bounding box with a gap in the middle.
+    const rects = [...el.getClientRects()].filter((r) => r.width > 0 && r.height > 0);
+    return rects[0] || el.getBoundingClientRect();
+  }
+
+  function isDisabled(el) {
+    return !!(el.disabled || el.closest?.("[aria-disabled='true'], fieldset:disabled") || el.getAttribute?.("aria-disabled") === "true");
+  }
+
+  /** Whether `node` is `ancestor` or inside it, crossing shadow-root boundaries. */
+  function composedContains(ancestor, node) {
+    for (let n = node; n; n = n.parentNode || n.host) {
+      if (n === ancestor) return true;
+    }
+    return false;
+  }
+
+  function deepElementFromPoint(doc, x, y) {
+    let hit = doc.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    return hit;
+  }
+
+  function receivesPointer(el, hit) {
+    if (!hit) return true;
+    if (composedContains(el, hit) || composedContains(hit, el)) return true;
+    // Clicking a control's <label> (e.g. a styled checkbox) acts on the control.
+    if (el.labels && [...el.labels].some((label) => composedContains(label, hit))) return true;
+    return false;
+  }
+
+  function describeNode(n, role) {
+    const name = nameOf(n, role);
+    return `${role}${name ? ` ${JSON.stringify(name)}` : ""} [ref=${newRef(n)}]`;
+  }
+
+  /** Short description of whatever covers an element, with refs the agent can act on. */
+  function describeBlocker(hit) {
+    let described = "";
+    for (let n = hit; n && n.nodeType === Node.ELEMENT_NODE; n = n.parentElement || n.getRootNode().host) {
+      const role = roleOf(n);
+      if (role && !described) {
+        described = describeNode(n, role);
+        if (role === "dialog" || role === "alertdialog") return described;
+      } else if (role === "dialog" || role === "alertdialog") {
+        // Name the overlay too: dismissing it is usually what unblocks the click.
+        return `${described} inside ${describeNode(n, role)}`;
+      }
+      if (n === n.ownerDocument.body) break;
+    }
+    if (described) return described;
+    const label = collapse(hit.innerText).slice(0, 60);
+    return `<${hit.tagName.toLowerCase()}>${label ? ` "${label}"` : ""} [ref=${newRef(hit)}]`;
+  }
+
+  /**
+   * Scrolls the element into view, waits until its position is stable and, with
+   * `check`, makes sure it is enabled and not covered by another element. Returns
+   * its centre in top-level viewport coordinates.
+   */
+  async function point(ref, check = true) {
+    const el = element(ref);
+    if (check && isDisabled(el)) throw new Error(`Element "${ref}" is disabled.`);
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    let last = boxOf(el);
+    for (let i = 0; i < 10; i++) {
+      await nextFrame();
+      const box = boxOf(el);
+      if (box.x === last.x && box.y === last.y && box.width === last.width && box.height === last.height) break;
+      last = box;
+    }
+    if (!check) return centerOf(ref);
+    for (let attempt = 0; ; attempt++) {
+      const box = boxOf(el);
+      const hit = deepElementFromPoint(el.ownerDocument, box.left + box.width / 2, box.top + box.height / 2);
+      if (receivesPointer(el, hit)) return centerOf(ref);
+      if (attempt >= 4) {
+        throw new Error(
+          `Element "${ref}" is covered by ${describeBlocker(hit)}, which would receive the click. Dismiss or close it first.`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   /** Both drag endpoints, measured after a single scroll so neither goes stale. */
@@ -374,7 +493,7 @@
 
   function centerOf(ref) {
     const el = element(ref);
-    const rect = el.getBoundingClientRect();
+    const rect = boxOf(el);
     if (rect.width === 0 && rect.height === 0) {
       throw new Error(`Element "${ref}" has no visible size and cannot be interacted with.`);
     }
@@ -393,30 +512,74 @@
     return { x, y };
   }
 
-  /** Focuses an editable element and selects its content so typing replaces it. */
-  function prepareTyping(ref) {
+  /** Input types whose value cannot be typed character by character. */
+  const DIRECT_VALUE_TYPES = new Set(["date", "datetime-local", "month", "week", "time", "color", "range"]);
+
+  /** How a field should be edited: "text" (focus + type), "direct" (set value) or an error. */
+  function editKind(ref) {
     const el = element(ref);
-    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    el.focus();
+    if (isDisabled(el)) throw new Error(`Element "${ref}" is disabled.`);
+    if (el.readOnly) throw new Error(`Element "${ref}" is read-only.`);
+    if (el.tagName === "INPUT") {
+      if (DIRECT_VALUE_TYPES.has(el.type)) return "direct";
+      if (["checkbox", "radio", "file", "button", "submit", "reset", "image", "hidden"].includes(el.type)) {
+        throw new Error(`Element "${ref}" is a ${el.type} input; use ${el.type === "file" ? "browser_file_upload" : "browser_click"}.`);
+      }
+      return "text";
+    }
+    if (el.tagName === "TEXTAREA" || el.isContentEditable) return "text";
+    throw new Error(`Element "${ref}" is not editable.`);
+  }
+
+  /** Sets a value the way frameworks (React, Vue) observe it: native setter + input/change events. */
+  function setValue(ref, value) {
+    const el = element(ref);
+    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (el.value !== String(value)) throw new Error(`Element "${ref}" did not accept the value ${JSON.stringify(value)} (now ${JSON.stringify(el.value)}).`);
+    return el.value;
+  }
+
+  /** Focuses an editable element and selects its content so typing replaces it. Returns whether it had content. */
+  function selectContent(ref) {
+    const el = element(ref);
     const doc = el.ownerDocument;
+    if (doc.activeElement !== el && !el.contains(doc.activeElement)) el.focus();
     if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+      const hadContent = el.value.length > 0;
       try {
         el.select();
       } catch {
-        el.value = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        // select() is unsupported for some types; typing will append in that case.
       }
-      return true;
+      return hadContent;
     }
-    if (el.isContentEditable) {
-      const range = doc.createRange();
-      range.selectNodeContents(el);
-      const selection = doc.defaultView.getSelection();
-      selection.removeAllRanges();
-      selection.addRange(range);
-      return true;
-    }
-    throw new Error(`Element "${ref}" is not editable.`);
+    const range = doc.createRange();
+    range.selectNodeContents(el);
+    const selection = doc.defaultView.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return collapse(el.innerText).length > 0;
+  }
+
+  /** Current value of a field, masked for passwords. */
+  function fieldValue(ref) {
+    const el = element(ref);
+    if (el.tagName === "INPUT" && el.type === "password") return "•".repeat(Math.min(el.value.length, 8));
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return el.value;
+    return clip(collapse(el.innerText), MAX_TEXT);
+  }
+
+  function isChecked(ref) {
+    const el = element(ref);
+    if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) return el.checked;
+    return el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-pressed") === "true";
+  }
+
+  function isNativeSelect(ref) {
+    return element(ref).tagName === "SELECT";
   }
 
   function selectOptions(ref, values) {
@@ -479,6 +642,7 @@
   }
 
   globalThis.__bmcp = {
-    snapshot, element, check, point, dragPoints, prepareTyping, selectOptions, isFileInput, scrollIntoView, viewport, settle,
+    snapshot, element, check, point, dragPoints, editKind, setValue, selectContent, fieldValue, isChecked,
+    isNativeSelect, selectOptions, isFileInput, scrollIntoView, viewport, settle,
   };
 })();
