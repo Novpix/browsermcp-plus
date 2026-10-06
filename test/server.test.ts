@@ -234,11 +234,17 @@ describe("MCP server", () => {
     expect(result.isError).toBe(true);
   });
 
-  it("long waits outlive the default request timeout", async () => {
+  it("waits on the server without occupying the extension", async () => {
     const { call, extension } = await setup({ requestTimeoutMs: 100 });
-    extension.handlers.browser_wait = () => new Promise((r) => setTimeout(r, 300));
-    const result = await call("browser_wait", { time: 0.3 });
-    expect(result.isError).toBeFalsy();
+    const started = Date.now();
+    const [waited, snapshot] = await Promise.all([
+      call("browser_wait", { time: 0.3 }),
+      call("browser_snapshot"),
+    ]);
+    expect(waited.isError).toBeFalsy();
+    expect(snapshot.isError).toBeFalsy();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(290);
+    expect(extension.received.map((m) => m.type)).not.toContain("browser_wait");
   });
 
   it("returns screenshots as PNG images", async () => {

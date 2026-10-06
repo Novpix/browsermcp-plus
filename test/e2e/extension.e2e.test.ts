@@ -494,6 +494,15 @@ describe("Browser MCP Plus extension end to end", () => {
       expect(back.text).toContain("- Page Title: Fixture actions");
     });
 
+    it("answers other tools while a long wait is running", async () => {
+      const started = Date.now();
+      const waiting = call("browser_wait", { time: 3 });
+      const found = await call("browser_find", { text: "Delete" });
+      expect(found.isError, found.text).toBeFalsy();
+      expect(Date.now() - started).toBeLessThan(1_500);
+      await waiting;
+    });
+
     it("keeps action replies short", async () => {
       const result = await call("browser_click", { element: "Search", ref: ref(snap, /button "Search"/) });
       expect(result.text.length).toBeLessThan(300);

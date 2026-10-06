@@ -173,6 +173,9 @@ chrome.alarms?.onAlarm.addListener(() => restore().then(ensureSocket));
 
 let queue = Promise.resolve();
 
+/** Reads that never touch the page, so they need not wait for the queue. */
+const UNQUEUED = new Set(["getUrl", "getTitle", "browser_tab_list", "browser_get_console_logs", "browser_wait"]);
+
 async function onServerMessage(ws, data) {
   let message;
   try {
@@ -184,12 +187,20 @@ async function onServerMessage(ws, data) {
 
   // Run requests one at a time so input events never interleave, and give
   // each a deadline so one that hangs cannot block everything queued after it.
+  // Plain reads don't touch the page and answer immediately, even while a
+  // long action is running.
   const timeoutMs =
     message.type === "browser_wait"
       ? (Number(message.payload?.time) || 0) * 1000 + REQUEST_TIMEOUT_MS
       : REQUEST_TIMEOUT_MS;
-  const run = queue.then(() => withTimeout(handle(message.type, message.payload ?? {}), timeoutMs, message.type));
-  queue = run.catch(() => {});
+  const execute = () => withTimeout(handle(message.type, message.payload ?? {}), timeoutMs, message.type);
+  let run;
+  if (UNQUEUED.has(message.type)) {
+    run = execute();
+  } else {
+    run = queue.then(execute);
+    queue = run.catch(() => {});
+  }
   let response;
   try {
     response = { requestId: message.id, result: await run };

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+- `browser_wait` ran inside the extension, which handles requests one at a
+  time, so any tool called during a long wait timed out with "did not
+  answer". Waiting now happens in the server, and plain reads (URL, title,
+  tab list, console) never queue behind a running action.
+
 ## 0.4.0
 
 Faster, leaner and harder to get stuck. Measured against 0.3.0 with the same
