@@ -1,6 +1,6 @@
 {
   "name": "browsermcp-plus",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP server + open-source Chrome extension that let AI apps automate your own browser: clicks, typing, file uploads, tabs, JavaScript",
   "author": "Novpix",
   "license": "Apache-2.0",

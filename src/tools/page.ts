@@ -80,11 +80,10 @@ export const wait = defineTool({
       .describe(`The time to wait in seconds (max ${MAX_WAIT_SECONDS})`),
   }),
   annotations: READ_ONLY,
-  handle: async (context, { time }) => {
-    // The request must outlive the wait itself.
-    await context.send("browser_wait", { time }, {
-      timeoutMs: time * 1000 + context.requestTimeoutMs,
-    });
+  handle: async (_context, { time }) => {
+    // Waits here rather than in the extension: the extension runs requests one
+    // at a time, so a wait there would block every tool called meanwhile.
+    await new Promise((resolve) => setTimeout(resolve, time * 1000));
     return text(`Waited for ${time} seconds`);
   },
 });

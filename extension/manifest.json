@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Browser MCP Plus",
   "short_name": "MCP Plus",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Let AI apps (Claude, Cursor, VS Code\u2026) automate the browser tab you connect: clicks, typing, file uploads, tabs and more.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwjgNuenrsFgA0qR5T3lcvrZx9CQAy1L7WxR0aDfkBZwfjMsEMRIMGiHa73BeObrbLM97p6AwL3Mg3QhI9bhP51rHUxT7E2mnf/6TpZV7tLuw57JPHw7Mvr7Qze5Jr4QYHbxw0SoyAA0VjFRsU6l334qyohvt12IKEsRp4eYSySU3CoWvfPZgY66bZebxf6PjGa2xcWANXhIvYxIChRobU3weO3n/fgyZwkVnC3svJNAXik4Cs0/EI5r2AUOwfqllQzIVG8e2WZy/0ki7KLZpHpu5q1pGsM17oh27Cw+9TduA/xeavPVaZQqgLKdCkJNhfCYBkdl7w9tHPPaJ0FOH7wIDAQAB",
