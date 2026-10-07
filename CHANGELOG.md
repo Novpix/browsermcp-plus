@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.0
+
+Several agents can now use the browser at the same time, each in its own tab.
+
+### Added
+
+- **Multi-agent.** The first server becomes the hub; servers started later
+  (other Claude Code sessions, other MCP clients) join it instead of taking
+  over the port. Each request carries its agent session, and each session
+  works in a tab of its own: a free connected tab if there is one, otherwise
+  a new tab next to them, grouped and labelled with the agent's name (the
+  project folder, or `--session-name`). Tabs of different agents run in
+  parallel; an agent cannot select or close another agent's tab. When an
+  agent exits its tab is freed for the next one; when the hub exits another
+  server takes its place and the extension reconnects.
+- **Background tabs work at full speed.** Chrome stops processing input in
+  hidden tabs and throttles their timers ~100x (measured: clicks never
+  arrived, 5 s each). Tabs an agent works in now get focus emulation, and
+  waiting/measuring moved from the page to the extension, so a background
+  agent clicks and types as fast as one in the active tab (~125 ms).
+- **New popup.** Shows the server state, how many agents are connected and
+  working, every agent's tab, last action, activity and last error (click
+  to jump to its tab), and which connected tabs are free.
+- `npm run test:real`: a regression test in a real, visible Chromium, which
+  Playwright-launched browsers cannot reproduce.
+
+### Changed
+
+- `browser_tab_select` no longer brings the tab to the front, so agents don't
+  steal the user's focus; `browser_tab_list` shows tabs used by other agents.
+- `--no-takeover` now means "don't share the browser with a running server".
+
 ## 0.4.1
 
 ### Fixed

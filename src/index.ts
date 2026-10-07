@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Command, InvalidArgumentError } from "commander";
 
@@ -37,7 +40,11 @@ const program = new Command()
     `additional origins allowed to connect as the extension (always allowed: ${DEFAULT_ALLOWED_ORIGINS.join(", ")})`,
     [],
   )
-  .option("--no-takeover", "do not ask an already running server to hand over the port")
+  .option(
+    "--session-name <name>",
+    "name shown for this agent in the browser (default: the current folder's name)",
+  )
+  .option("--no-takeover", "do not share the browser with a server that is already running")
   .option(
     "--kill-existing",
     "terminate whatever listens on the port if it does not hand it over (pre-0.2 behaviour)",
@@ -64,6 +71,7 @@ const program = new Command()
 
 type CliOptions = {
   port: number;
+  sessionName?: string;
   allowOrigin: string[];
   takeover: boolean;
   killExisting: boolean;
@@ -81,6 +89,10 @@ async function main() {
   const server = await createServer({
     version: packageJSON.version,
     port: options.port,
+    session: {
+      id: randomUUID().slice(0, 8),
+      name: options.sessionName || path.basename(process.cwd()) || "agent",
+    },
     allowedOrigins: [...DEFAULT_ALLOWED_ORIGINS, ...options.allowOrigin],
     takeover: options.takeover,
     killExisting: options.killExisting,

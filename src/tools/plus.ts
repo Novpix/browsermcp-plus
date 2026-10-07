@@ -112,14 +112,19 @@ async function tabResult(context: Parameters<typeof snapshotResult>[0], status: 
 }
 
 function formatTab(tab: TabInfo): string {
-  const flags = [tab.connected && "connected", tab.active && "active"].filter(Boolean);
+  const flags = [
+    tab.connected && "connected",
+    tab.agent && `used by agent ${JSON.stringify(tab.agent)}`,
+    tab.active && "active",
+  ].filter(Boolean);
   const suffix = flags.length ? ` (${flags.join(", ")})` : "";
   return `- [${tab.id}] ${tab.title || "(untitled)"} — ${tab.url}${suffix}`;
 }
 
 export const tabList = defineTool({
   name: "browser_tab_list",
-  description: "List open browser tabs. The connected tab is the one other tools act on.",
+  description:
+    "List open browser tabs. Your tab is marked connected; tabs used by other agents are marked and cannot be selected.",
   inputSchema: z.object({}),
   annotations: READ_ONLY,
   handle: async (context) => {
@@ -143,7 +148,7 @@ export const tabNew = defineTool({
 
 export const tabSelect = defineTool({
   name: "browser_tab_select",
-  description: "Switch the connected tab (use ids from browser_tab_list)",
+  description: "Work in another tab (ids from browser_tab_list). Tabs used by other agents cannot be selected.",
   inputSchema: z.object({
     tabId: z.number().int().describe("Tab id from browser_tab_list"),
   }),

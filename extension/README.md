@@ -25,6 +25,15 @@ tool works, and adds what that closed extension cannot do:
 The extension ID is pinned by the manifest `key`
 (`kjcoeimgiimkjbeeblldadmlebheajgb`) and allowed by the server by default.
 
+## Several agents
+
+Requests carry the agent session that sent them. The tabs you connect form a
+pool; each session takes a free one or gets a new tab (grouped and labelled
+with its name) when all are busy, and requests for different tabs run in
+parallel. Tabs an agent works in get focus emulation, because Chrome stops
+processing input in hidden tabs. The popup lists agents, their tabs and
+activity.
+
 ## How it works
 
 - `background.js` keeps a WebSocket to `ws://localhost:9009` (configurable in

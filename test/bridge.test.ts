@@ -80,7 +80,7 @@ describe("ExtensionBridge", () => {
       "x-browsermcp-takeover": "1",
     });
     expect(status).toBe(403);
-    expect(bridge.state).toBe("active");
+    expect(bridge.state).toBe("hub");
   });
 
   it("accepts extra origins when configured", async () => {
@@ -101,41 +101,88 @@ describe("ExtensionBridge", () => {
     expect(bridge.isConnected).toBe(true);
   });
 
-  it("getConnection waits for an extension that connects late", async () => {
+  it("getChannel waits for an extension that connects late", async () => {
     const port = await freePort();
     const bridge = await startBridge(port);
-    const pending = bridge.getConnection(3_000);
+    const pending = bridge.getChannel(3_000);
     const late = new Promise((r) => setTimeout(r, 200)).then(() => connectExtension(port));
     await expect(pending).resolves.toBeDefined();
     await late;
   });
 
-  it("getConnection fails with guidance when nothing connects", async () => {
+  it("getChannel fails with guidance when nothing connects", async () => {
     const port = await freePort();
     const bridge = await startBridge(port);
-    await expect(bridge.getConnection(100)).rejects.toThrow(NO_CONNECTION_MESSAGE);
+    await expect(bridge.getChannel(100)).rejects.toThrow(NO_CONNECTION_MESSAGE);
   });
 
-  it("hands the port over to a newer server and resumes when it exits", async () => {
+  it("a second server joins the hub and its requests carry its own session", async () => {
     const port = await freePort();
-    const older = await startBridge(port);
-    const oldExtension = await connectExtension(port);
-    await waitUntil(() => older.isConnected);
+    const hub = await startBridge(port, { session: { id: "aaa", name: "shop" } });
+    const extension = new FakeExtension({ getUrl: () => "https://example.com/" });
+    cleanups.push(() => extension.close());
+    await extension.connect(port);
+    await waitUntil(() => hub.isConnected);
 
-    const newer = new ExtensionBridge({ port, standbyRetryMs: 100 });
-    await newer.start();
-    expect(newer.state).toBe("active");
-    expect(older.state).toBe("standby");
-    await waitUntil(() => oldExtension.ws.readyState === WebSocket.CLOSED);
-    await expect(older.getConnection(50)).rejects.toThrow(/took over/);
+    const second = await startBridge(port, { session: { id: "bbb", name: "blog" } });
+    expect(hub.state).toBe("hub");
+    expect(second.state).toBe("client");
+    await waitUntil(() => second.isConnected);
+    expect(hub.clientSessions).toEqual([{ id: "bbb", name: "blog" }]);
 
-    await connectExtension(port);
-    await waitUntil(() => newer.isConnected);
+    const [viaHub, viaClient] = await Promise.all([
+      hub.getChannel(1_000).then((c) => c.request("getUrl", undefined, 1_000)),
+      second.getChannel(1_000).then((c) => c.request("getUrl", undefined, 1_000)),
+    ]);
+    expect(viaHub).toBe("https://example.com/");
+    expect(viaClient).toBe("https://example.com/");
+    expect([...extension.sessions].sort()).toEqual(["aaa", "bbb"]);
+  });
 
-    await newer.close();
-    await waitUntil(() => older.state === "active");
-    await connectExtension(port);
-    await waitUntil(() => older.isConnected);
+  it("tells the extension which sessions are alive", async () => {
+    const port = await freePort();
+    await startBridge(port, { session: { id: "aaa", name: "shop" } });
+    const updates: unknown[] = [];
+    const extension = new FakeExtension(
+      { sessions_update: (payload: { sessions: unknown[] }) => updates.push(payload.sessions) },
+      ["sessions_update"],
+    );
+    cleanups.push(() => extension.close());
+    await extension.connect(port);
+    const second = await startBridge(port, { session: { id: "bbb", name: "blog" } });
+    await waitUntil(() => updates.length > 0, 5_000);
+    expect(updates.at(-1)).toEqual([
+      { id: "aaa", name: "shop" },
+      { id: "bbb", name: "blog" },
+    ]);
+
+    await second.close();
+    await waitUntil(() => (updates.at(-1) as unknown[]).length === 1, 5_000);
+    expect(updates.at(-1)).toEqual([{ id: "aaa", name: "shop" }]);
+  });
+
+  it("when the hub exits another server takes its place", async () => {
+    const port = await freePort();
+    const hub = new ExtensionBridge({ port, session: { id: "aaa", name: "shop" } });
+    await hub.start();
+    const second = await startBridge(port, { session: { id: "bbb", name: "blog" } });
+    expect(second.state).toBe("client");
+
+    await hub.close();
+    await waitUntil(() => second.state === "hub", 5_000);
+    const extension = new FakeExtension({ getUrl: () => "https://after.example/" });
+    cleanups.push(() => extension.close());
+    await extension.connect(port);
+    const channel = await second.getChannel(2_000);
+    await expect(channel.request("getUrl", undefined, 1_000)).resolves.toBe("https://after.example/");
+    expect(extension.sessions).toEqual(["bbb"]);
+  });
+
+  it("rejects take-over requests from older versions instead of giving up the port", async () => {
+    const port = await freePort();
+    const hub = await startBridge(port);
+    expect(await upgradeStatus(port, { "x-browsermcp-takeover": "1" })).toBe(409);
+    expect(hub.state).toBe("hub");
   });
 
   it("goes into standby, without killing anything, when a foreign process holds the port", async () => {
@@ -147,10 +194,10 @@ describe("ExtensionBridge", () => {
     const bridge = await startBridge(port);
     expect(bridge.state).toBe("standby");
     expect(foreign.listening).toBe(true);
-    await expect(bridge.getConnection(50)).rejects.toThrow(/in use by another process/);
+    await expect(bridge.getChannel(50)).rejects.toThrow(/in use by another process/);
 
     await new Promise((resolve) => foreign.close(resolve));
-    await waitUntil(() => bridge.state === "active");
+    await waitUntil(() => bridge.state === "hub");
   });
 
   it("detects a legacy server holding the wildcard address instead of shadowing it", async () => {
@@ -165,11 +212,11 @@ describe("ExtensionBridge", () => {
     expect(legacy.listening).toBe(true);
   });
 
-  it("does not take over when takeover is disabled", async () => {
+  it("does not join or take over when sharing is disabled", async () => {
     const port = await freePort();
     const older = await startBridge(port);
     const newer = await startBridge(port, { takeover: false });
-    expect(older.state).toBe("active");
+    expect(older.state).toBe("hub");
     expect(newer.state).toBe("standby");
   });
 
