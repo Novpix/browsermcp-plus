@@ -758,7 +758,7 @@ async function runAction(tabId, action, { startWindowMs = 80, allowDialog = fals
 
 async function actionReport(tabId, tracker, value, opened = []) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  const report = { url: tab?.url ?? "", title: tab?.title ?? "", navigated: tracker.started };
+  const report = { url: tab?.url || tab?.pendingUrl || "", title: tab?.title ?? "", navigated: tracker.started };
   if (state.dialogs.has(tabId)) report.dialog = { ...state.dialogs.get(tabId) };
   if (opened.length) {
     const tabs = await Promise.all(opened.map((id) => chrome.tabs.get(id).then((t) => tabInfo(t), () => null)));
@@ -1035,7 +1035,8 @@ function tabInfo(tab, session) {
     id: tab.id,
     windowId: tab.windowId,
     title: tab.title ?? "",
-    url: tab.url ?? tab.pendingUrl ?? "",
+    // A tab that is still loading has an empty url and the target in pendingUrl.
+    url: tab.url || tab.pendingUrl || "",
     active: tab.active,
     connected: !!session && owner?.id === session.id,
     ...(owner && owner.id !== session?.id ? { agent: owner.name } : {}),
@@ -1215,7 +1216,15 @@ const handlers = {
 
   async browser_tab_new({ url }, { session }) {
     const tabId = await openTabFor(session, url);
-    await assign(session, tabId);
+    try {
+      await assign(session, tabId);
+    } catch (error) {
+      // e.g. chrome:// pages: the tab stays open for the user but is not for agents.
+      state.pool.delete(tabId);
+      state.created.delete(tabId);
+      await persist();
+      throw error;
+    }
     if (url) await waitForDocument(tabId);
     return tabInfo(await chrome.tabs.get(tabId), session);
   },
@@ -1266,7 +1275,7 @@ async function status() {
     tabs.push({
       id: tab.id,
       title: tab.title ?? "",
-      url: tab.url ?? "",
+      url: tab.url || tab.pendingUrl || "",
       favIconUrl: tab.favIconUrl ?? "",
       agent: session?.name ?? null,
       color: session?.color ?? null,
