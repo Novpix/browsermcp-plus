@@ -400,42 +400,49 @@ export class ExtensionBridge {
   private async tryJoin(): Promise<boolean> {
     if (this._state === "closed") return false;
     for (const host of ["127.0.0.1", "[::1]"]) {
-      const ws = await new Promise<WebSocket | undefined>((resolve) => {
-        const socket = new WebSocket(`ws://${host}:${this.port}`, {
-          headers: {
-            [SESSION_HEADER]: this.session.id,
-            [SESSION_NAME_HEADER]: encodeURIComponent(this.session.name),
-          },
-        });
+      const socket = new WebSocket(`ws://${host}:${this.port}`, {
+        headers: {
+          [SESSION_HEADER]: this.session.id,
+          [SESSION_NAME_HEADER]: encodeURIComponent(this.session.name),
+        },
+      });
+      // Listen before the socket opens: the hub sends the extension's status
+      // right away, possibly in the same packet as the handshake.
+      let joined = false;
+      const client = new HubClient(socket, () => {
+        if (joined) void this.elect();
+      });
+      const opened = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => {
           socket.terminate();
-          resolve(undefined);
+          resolve(false);
         }, 2_000);
         socket.once("open", () => {
           clearTimeout(timer);
-          resolve(socket);
+          resolve(true);
         });
         socket.once("unexpected-response", () => {
           clearTimeout(timer);
           socket.terminate();
-          resolve(undefined);
+          resolve(false);
         });
         socket.once("error", () => {
           clearTimeout(timer);
-          resolve(undefined);
+          resolve(false);
         });
       });
-      if (!ws) continue;
+      if (!opened) continue;
       if ((this._state as BridgeState) === "closed") {
-        ws.close();
+        client.close();
         return false;
       }
-      this.hubClient = new HubClient(ws, () => void this.elect());
+      joined = true;
+      this.hubClient = client;
       this._state = "client";
       clearInterval(this.standbyTimer);
       this.standbyTimer = undefined;
       log.info(`Joined the browsermcp-plus server on port ${this.port} as agent "${this.session.name}"`);
-      await Promise.race([this.hubClient.ready, sleep(1_000)]);
+      await Promise.race([client.ready, sleep(1_000)]);
       this.notifyChange();
       return true;
     }

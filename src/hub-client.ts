@@ -124,6 +124,11 @@ export class HubClient implements Channel {
   }
 
   private handleClose() {
+    if (this.closed && this.pending.size === 0) {
+      // Never opened, or closed on purpose.
+      for (const waiter of this.statusWaiters) waiter();
+      return;
+    }
     const wasOpen = !this.closed;
     this.closed = true;
     const error = new Error("Lost the connection to the browsermcp-plus hub. Retry the tool call.");
