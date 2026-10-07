@@ -23,7 +23,7 @@ and stays compatible with its extension. [Türkçe README](README.tr.md)
 | Extension source | closed | open source ([`extension/`](extension/)) |
 | Server reachable from the network | yes, all interfaces | loopback only |
 | Any web page can connect to the server | yes | no, origin allowlist |
-| Starting a second client | `kill -9` on the port | cooperative hand-over, then resume |
+| Several agents at once | each new client kills the previous one | every agent in its own tab, in parallel |
 | Builds from its own repository, tests, CI | ✗ | ✓ unit + real-browser end-to-end tests |
 
 ## Install
@@ -106,8 +106,9 @@ everything except upload, forms, dialogs, evaluate, scroll and tabs works.
 
 ```
 --port <number>            WebSocket port (default 9009)
+--session-name <name>      agent name shown in the browser (default: current folder)
 --allow-origin <origin...> extra extension origins allowed to connect
---no-takeover              don't ask a running server to hand over the port
+--no-takeover              don't share the browser with a running server
 --kill-existing            terminate a non-cooperating process on the port
 --request-timeout <ms>     timeout for a single browser action (default 30000)
 --snapshot-max-chars <n>   truncate large snapshots (default 80000, 0 = never)
@@ -115,11 +116,20 @@ everything except upload, forms, dialogs, evaluate, scroll and tabs works.
 --verbose                  debug logging on stderr
 ```
 
-## Several MCP clients
+## Several agents at once
 
-Only one server can talk to the extension at a time. When another client
-starts the server, the new instance asks the running one to hand over the port;
-the older one waits and takes over again once the newer one exits.
+Every Claude Code session (or other MCP client) that starts browsermcp-plus is
+an agent with its own tab, and agents work in parallel:
+
+- The tabs you connect are shared: an agent takes a free one, or gets a new
+  tab next to them when all are busy. Tabs opened for an agent are grouped
+  and labelled with its name (the project folder, or `--session-name`).
+- An agent cannot select or close another agent's tab; when an agent exits,
+  its tab is freed for the next one.
+- The first server is the hub the extension connects to; the others join it.
+  If the hub exits, another server takes its place automatically.
+- The extension popup shows every agent, its tab, what it is doing and its
+  last error. "Stop all" disconnects everything.
 
 ## Security model
 
@@ -135,7 +145,8 @@ the older one waits and takes over again once the newer one exits.
 ```sh
 npm install
 npm run check     # typecheck + unit tests + build
-npm run test:e2e  # real Chromium + extension end to end
+npm run test:e2e  # Chromium + extension end to end (single and multi-agent)
+npm run test:real # background tabs in a real, visible Chromium (needs a display)
 ```
 
 The wire protocol is documented in [`src/protocol.ts`](src/protocol.ts), the

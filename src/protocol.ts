@@ -60,6 +60,8 @@ export type ExtensionMessages = {
     result: ActionResult;
   };
   browser_handle_dialog: { payload: { accept: boolean; promptText?: string }; result: ActionResult };
+  /** Which agent sessions are alive, so the extension frees the tabs of the others. */
+  sessions_update: { payload: { sessions: SessionIdentity[] }; result: unknown };
   browser_fill_form: { payload: { fields: FormField[] }; result: ActionResult };
   browser_tab_list: { payload: Record<string, never>; result: TabInfo[] };
   browser_tab_new: { payload: { url?: string }; result: TabInfo };
@@ -105,8 +107,14 @@ export type TabInfo = {
   title: string;
   url: string;
   active: boolean;
+  /** This agent's tab. */
   connected: boolean;
+  /** Name of the other agent working in this tab, if any. */
+  agent?: string;
 };
+
+/** An agent session: one MCP server process, usually one Claude Code session. */
+export type SessionIdentity = { id: string; name: string };
 
 export type EvaluateResult = {
   type: string;
@@ -126,6 +134,7 @@ export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_tab_close",
   "browser_handle_dialog",
   "browser_fill_form",
+  "sessions_update",
 ]);
 
 /** Sent by the Browser MCP Plus extension right after connecting. */
@@ -194,6 +203,7 @@ export class ExtensionConnection {
     type: T,
     payload: Payload<T>,
     timeoutMs: number,
+    session?: SessionIdentity,
   ): Promise<Result<T>> {
     if (!this.isOpen) {
       return Promise.reject(new Error(NO_CONNECTION_MESSAGE));
@@ -216,7 +226,8 @@ export class ExtensionConnection {
         reject,
         timer,
       });
-      this.ws.send(JSON.stringify({ id, type, payload }), (error) => {
+      const routing = session ? { sessionId: session.id, sessionName: session.name } : {};
+      this.ws.send(JSON.stringify({ id, type, payload, ...routing }), (error) => {
         if (error) this.settle(id, { error: error.message });
       });
     });
@@ -275,7 +286,39 @@ export class ExtensionConnection {
   }
 }
 
-function isResponse(message: unknown): message is {
+/** What tools talk to: the extension, on behalf of one agent session. */
+export interface Channel {
+  readonly info: ExtensionInfo | undefined;
+  readonly ready: Promise<void>;
+  supports(type: MessageType): boolean;
+  request<T extends MessageType>(type: T, payload: Payload<T>, timeoutMs: number): Promise<Result<T>>;
+}
+
+/** The hub's own session, talking to the extension directly. */
+export class SessionChannel implements Channel {
+  constructor(
+    private readonly connection: ExtensionConnection,
+    private readonly session: SessionIdentity,
+  ) {}
+
+  get info() {
+    return this.connection.info;
+  }
+
+  get ready() {
+    return this.connection.ready;
+  }
+
+  supports(type: MessageType) {
+    return this.connection.supports(type);
+  }
+
+  request<T extends MessageType>(type: T, payload: Payload<T>, timeoutMs: number) {
+    return this.connection.request(type, payload, timeoutMs, this.session);
+  }
+}
+
+export function isResponse(message: unknown): message is {
   type: typeof MESSAGE_RESPONSE_TYPE;
   payload: { requestId: string; result?: unknown; error?: unknown };
 } {
@@ -289,7 +332,7 @@ function isResponse(message: unknown): message is {
   );
 }
 
-function isHello(message: unknown): message is { type: "hello"; payload: ExtensionInfo } {
+export function isHello(message: unknown): message is { type: "hello"; payload: ExtensionInfo } {
   if (typeof message !== "object" || message === null) return false;
   const { type, payload } = message as { type?: unknown; payload?: Partial<ExtensionInfo> };
   return (

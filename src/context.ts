@@ -40,15 +40,15 @@ export class Context {
     payload: Payload<T>,
     options: { timeoutMs?: number } = {},
   ): Promise<Result<T>> {
-    const connection = await this.bridge.getConnection(this.connectWaitMs);
+    const channel = await this.bridge.getChannel(this.connectWaitMs);
     if (PLUS_MESSAGES.has(type)) {
-      await connection.ready;
-      if (!connection.supports(type)) {
+      await channel.ready;
+      if (!channel.supports(type)) {
         throw new Error(
           `This tool needs the Browser MCP Plus extension (${REPOSITORY_URL}); the connected extension does not support "${type}".`,
         );
       }
     }
-    return connection.request(type, payload, options.timeoutMs ?? this.requestTimeoutMs);
+    return channel.request(type, payload, options.timeoutMs ?? this.requestTimeoutMs);
   }
 }

@@ -34,6 +34,7 @@ Alternatif: Sürüm sayfasındaki tek dosyalık `browsermcp-plus.cjs`'i indirip 
 
 - **Dosya yükleme:** Hem dosya alanlarına hem "dosya seç" butonlarına çalışır, işletim sisteminin dosya penceresi açılmaz.
 - **Hızlı ve tutumlu:** Tıklama gibi işlemler ~100 ms sürer ve tüm sayfa yerine kısa bir rapor döner (Wikipedia'da ~14.000 yerine ~30 token). Formlar `browser_fill_form` ile tek çağrıda doldurulur.
+- **Çoklu ajan:** Her Claude Code oturumu ayrı bir ajandır ve kendi sekmesinde paralel çalışır. Boş sekme varsa onu alır, yoksa yeni sekme açılır (ajan adıyla etiketli grup). Ajanlar birbirinin sekmesine dokunamaz; eklenti penceresinde hangi ajanın ne yaptığı görünür.
 - **Takılmaz:** alert/confirm pencereleri yakalanır ve yönetilir; üstü kapalı ya da pasif butona tıklama, sebebi söylenerek reddedilir; tıklamayla açılan yeni sekmeler bildirilir.
 - **Ek araçlar:** JavaScript çalıştırma, sekme yönetimi, kaydırma.
 - **Güvenlik:** Sunucu yalnızca bu bilgisayardan erişilebilir ve web sayfaları sunucuya bağlanamaz.

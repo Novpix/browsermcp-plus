@@ -373,17 +373,6 @@
     return el;
   }
 
-  function nextFrame() {
-    // requestAnimationFrame stalls in background tabs, so cap the wait.
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, 50);
-      requestAnimationFrame(() => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-  }
-
   function boxOf(el) {
     // Inline elements wrapping across lines have a bounding box with a gap in the middle.
     const rects = [...el.getClientRects()].filter((r) => r.width > 0 && r.height > 0);
@@ -444,34 +433,20 @@
     return `<${hit.tagName.toLowerCase()}>${label ? ` "${label}"` : ""} [ref=${newRef(hit)}]`;
   }
 
-  /**
-   * Scrolls the element into view, waits until its position is stable and, with
-   * `check`, makes sure it is enabled and not covered by another element. Returns
-   * its centre in top-level viewport coordinates.
-   */
-  async function point(ref, check = true) {
+  /** Validates a click target and scrolls it into view; position and coverage are checked by the caller. */
+  function prepareTarget(ref, check = true) {
     const el = element(ref);
     if (check && isDisabled(el)) throw new Error(`Element "${ref}" is disabled.`);
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    let last = boxOf(el);
-    for (let i = 0; i < 10; i++) {
-      await nextFrame();
-      const box = boxOf(el);
-      if (box.x === last.x && box.y === last.y && box.width === last.width && box.height === last.height) break;
-      last = box;
-    }
-    if (!check) return centerOf(ref);
-    for (let attempt = 0; ; attempt++) {
-      const box = boxOf(el);
-      const hit = deepElementFromPoint(el.ownerDocument, box.left + box.width / 2, box.top + box.height / 2);
-      if (receivesPointer(el, hit)) return centerOf(ref);
-      if (attempt >= 4) {
-        throw new Error(
-          `Element "${ref}" is covered by ${describeBlocker(hit)}, which would receive the click. Dismiss or close it first.`,
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    return true;
+  }
+
+  /** What would receive a click at the element's centre instead of it, or null. */
+  function blocker(ref) {
+    const el = element(ref);
+    const box = boxOf(el);
+    const hit = deepElementFromPoint(el.ownerDocument, box.left + box.width / 2, box.top + box.height / 2);
+    return receivesPointer(el, hit) ? null : describeBlocker(hit);
   }
 
   /** Both drag endpoints, measured after a single scroll so neither goes stale. */
@@ -621,28 +596,21 @@
     return { width: window.innerWidth, height: window.innerHeight };
   }
 
-  /** Resolves once the DOM has been quiet for `quietMs`, or after `maxMs`. */
-  function settle(quietMs = 150, maxMs = 2000) {
-    return new Promise((resolve) => {
-      let timer;
-      const done = () => {
-        observer.disconnect();
-        clearTimeout(timer);
-        clearTimeout(cap);
-        resolve(true);
-      };
-      const observer = new MutationObserver(() => {
-        clearTimeout(timer);
-        timer = setTimeout(done, quietMs);
-      });
-      observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
-      timer = setTimeout(done, quietMs);
-      const cap = setTimeout(done, maxMs);
-    });
+  // Counts DOM mutations so the extension can tell when the page has settled.
+  // The waiting itself happens in the extension, whose timers are not
+  // throttled like a background tab's.
+  let mutationCount = 0;
+  new MutationObserver((records) => {
+    mutationCount += records.length;
+  }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+
+  function mutations() {
+    return mutationCount;
   }
 
   globalThis.__bmcp = {
-    snapshot, element, check, point, dragPoints, editKind, setValue, selectContent, fieldValue, isChecked,
-    isNativeSelect, selectOptions, isFileInput, scrollIntoView, viewport, settle,
+    snapshot, element, check, prepareTarget, center: centerOf, blocker, dragPoints, editKind, setValue,
+    selectContent, fieldValue, isChecked, isNativeSelect, selectOptions, isFileInput, scrollIntoView, viewport,
+    mutations,
   };
 })();

@@ -1,6 +1,6 @@
 {
   "name": "browsermcp-plus",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "MCP server + open-source Chrome extension that let AI apps automate your own browser: clicks, typing, file uploads, tabs, JavaScript",
   "author": "Novpix",
   "license": "Apache-2.0",
@@ -40,7 +40,8 @@
     "check": "npm run typecheck && npm test && npm run build",
     "prepare": "npm run build",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
+    "test:real": "npm run build && REAL_CHROME=1 vitest run --config vitest.e2e.config.ts test/e2e/real-chrome.e2e.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

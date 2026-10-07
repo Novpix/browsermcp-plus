@@ -46,6 +46,8 @@ type Handler = (payload: any) => unknown | Promise<unknown>;
  */
 export class FakeExtension {
   readonly received: { type: string; payload: unknown }[] = [];
+  /** Session id of each received request, in the same order. */
+  readonly sessions: (string | undefined)[] = [];
   ws!: WebSocket;
 
   constructor(
@@ -66,8 +68,9 @@ export class FakeExtension {
       );
     });
     this.ws.on("message", async (data) => {
-      const { id, type, payload } = JSON.parse(data.toString());
+      const { id, type, payload, sessionId } = JSON.parse(data.toString());
       this.received.push({ type, payload });
+      this.sessions.push(sessionId);
       const handler = this.handlers[type];
       let response: { requestId: string; result?: unknown; error?: string };
       try {

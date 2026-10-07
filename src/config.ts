@@ -51,6 +51,17 @@ export const DEFAULT_CONNECT_WAIT_MS = 5_000;
 /** Header a newer server instance sends to ask the current one to hand over the port. */
 export const TAKEOVER_HEADER = "x-browsermcp-takeover";
 
+/** Header a server sends to join the running server (the hub) as another agent session. */
+export const SESSION_HEADER = "x-browsermcp-session";
+export const SESSION_NAME_HEADER = "x-browsermcp-session-name";
+
+/**
+ * How long the hub waits after a change before telling the extension which
+ * sessions are alive; lets sessions rejoin after the hub moved without losing
+ * their tabs.
+ */
+export const SESSIONS_UPDATE_DELAY_MS = 1_500;
+
 /** Close code used to acknowledge a takeover request. */
 export const TAKEOVER_ACK_CODE = 4001;
 
