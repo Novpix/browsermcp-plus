@@ -107,6 +107,7 @@ describe("tab lists", () => {
       tab({ id: 3, windowId: 9, title: "Mail", owner: "user", active: true, focusedWindow: true }),
       tab({ id: 4, windowId: 9, title: "Shared", owner: "user-connected", focusedWindow: true }),
       tab({ id: 5, windowId: 9, title: "Sign in", owner: "handed-off", note: "sign-in needed", focusedWindow: true }),
+      tab({ id: 6, windowId: 7, title: "Order", owner: "taken", note: "finishing the order", connected: true, userSteppedIn: true }),
     ]);
     expect(text.split("\n")[0]).toBe("Window 1 (the user's current window) [9]:");
     expect(text).toContain("- [3] Mail — https://example.com/ (the user's — hands off, active)");
@@ -115,6 +116,9 @@ describe("tab lists", () => {
     expect(text).toContain("Window 2 [7]:");
     expect(text).toContain("- [1] Mine — https://example.com/ (yours, you work in it, in the AI group)");
     expect(text).toContain("- [2] Beta's — https://example.com/ (agent \"beta\"'s — hands off)");
+    expect(text).toContain(
+      '- [6] Order — https://example.com/ (the user\'s, lent to you: "finishing the order", you work in it — give it back with browser_tab_release, the user stepped in: ask them, then browser_tab_select to resume)',
+    );
   });
 });
 

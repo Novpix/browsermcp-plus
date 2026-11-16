@@ -81,7 +81,15 @@ function render(status) {
   const here = status.activeConnected;
   const agentTab = status.activeAgentTab;
   const toggle = $("toggle");
-  if (status.activeHandoff) {
+  if (status.activeTaken) {
+    // An agent took this tab of the user's to work in.
+    $("currentText").textContent = `${status.activeTaken.agent} is working in your tab: ${status.activeTaken.note}`;
+    toggle.textContent = "Give back";
+    toggle.className = "primary";
+    toggle.disabled = false;
+    toggle.title = "The agent lets go; the tab goes back to where it was.";
+    toggle.onclick = () => run(() => call("giveBack", { tabId: status.activeTabId }));
+  } else if (status.activeHandoff) {
     // An agent left this tab to the user.
     $("currentText").textContent = `${status.activeHandoff.agent} is waiting for you: ${status.activeHandoff.note}`;
     toggle.textContent = "Done";
@@ -141,7 +149,9 @@ function render(status) {
         { class: "top" },
         el("span", { class: "busy" }),
         el("span", { class: "name ellipsis", textContent: agent.name }),
-        el("span", { class: "chip", textContent: `${agent.actions} action${agent.actions === 1 ? "" : "s"}` }),
+        agent.pausedByUser
+          ? el("span", { class: "chip", title: "You clicked or typed in its tab; it waits for you in the terminal", textContent: "paused · listening" })
+          : el("span", { class: "chip", textContent: `${agent.actions} action${agent.actions === 1 ? "" : "s"}` }),
       ),
       el(
         "div",
@@ -185,6 +195,13 @@ function render(status) {
       tab.agent
         ? el("span", { class: "owner", "--agent": AGENT_COLORS[tab.color] ?? AGENT_COLORS.blue, textContent: tab.agent })
         : el("span", { class: "owner free", textContent: "free" }),
+      tab.taken &&
+        el("button", {
+          class: "keep",
+          textContent: "Give back",
+          title: "The agent lets go of your tab; it goes back to where it was",
+          onclick: () => run(() => call("giveBack", { tabId: tab.id })),
+        }),
       tab.openedForAgent &&
         el("button", {
           class: "keep",

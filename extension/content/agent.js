@@ -980,10 +980,12 @@
     tr: {
       reading: "okuyor", typing: "yazıyor", clicking: "tıklıyor", opening: "sayfayı açıyor", scrolling: "kaydırıyor",
       looking: "bakıyor", uploading: "dosya yüklüyor", running: "çalışıyor", handoff: "Sende",
+      paused: "Durdum · seni dinliyorum",
     },
     en: {
       reading: "reading", typing: "typing", clicking: "clicking", opening: "opening the page", scrolling: "scrolling",
       looking: "looking", uploading: "uploading a file", running: "working", handoff: "Your turn",
+      paused: "Paused · listening",
     },
   };
   const LANG = (navigator.language || "en").toLowerCase().startsWith("tr") ? "tr" : "en";
@@ -995,7 +997,7 @@
       position: fixed; inset: 0; pointer-events: none;
       box-shadow: inset 0 0 0 1px rgba(10, 132, 255, .45), inset 0 0 22px rgba(10, 132, 255, .22), inset 0 0 64px rgba(10, 132, 255, .10);
     }
-    .handoff .glow { display: none; }
+    .handoff .glow, .paused .glow { display: none; }
     .label {
       position: fixed; right: 14px; bottom: 14px; max-width: min(320px, calc(100vw - 28px));
       display: flex; align-items: center; gap: 7px; padding: 6px 12px 6px 10px; box-sizing: border-box;
@@ -1007,6 +1009,7 @@
     .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #0a84ff; box-shadow: 0 0 6px rgba(10, 132, 255, .7); }
     .handoff .dot { background: #ff9f0a; box-shadow: 0 0 6px rgba(255, 159, 10, .7); }
+    .paused .dot { background: #f5f5f7; box-shadow: none; }
     @media (prefers-reduced-motion: reduce) { .glow, .label { transition: none; } }
   `;
   let overlay = null;
@@ -1041,14 +1044,29 @@
     box.append(glow, label);
     root.append(box);
     (document.documentElement || document).appendChild(host);
-    overlay = { host, box, text, timer: null, handoff: false };
+    overlay = { host, box, text, timer: null, handoff: false, paused: false };
     return overlay;
   }
+
+  // Real user input (not the page's own synthetic events) goes to the
+  // background, which tells it from the agent's input by time: a click or key
+  // in an agent's tab pauses the agent there; in a handed-over tab it ends
+  // the handover. Looking, scrolling and moving the mouse are not input here.
+  let lastInputReport = 0;
+  const reportInput = (event) => {
+    if (!event.isTrusted) return;
+    const now = Date.now();
+    if (now - lastInputReport < 250) return;
+    lastInputReport = now;
+    chrome.runtime.sendMessage({ cmd: "userInput", kind: event.type === "keydown" ? "key" : "click", at: now }).catch(() => {});
+  };
+  addEventListener("pointerdown", reportInput, true);
+  addEventListener("keydown", reportInput, true);
 
   /** Shows that `agent` is working here and what it is doing; fades out when it stops. */
   function activity(agent, kind) {
     const o = ensureOverlay();
-    if (!o || o.handoff) return false;
+    if (!o || o.handoff || o.paused) return false;
     o.text.textContent = `${agent} · ${WORDS[LANG][kind] ?? kind}`;
     o.box.className = "on";
     clearTimeout(o.timer);
@@ -1057,48 +1075,47 @@
   }
 
   /**
-   * The agent left this tab to the user with a note. The label stays until
-   * the user acts on the page; with `blink`, the tab's title and icon also
-   * alternate with the note (about once a second) until the background
-   * tells it the user is looking (handoffQuiet).
+   * The agent left this tab to the user with a note: the label stays and the
+   * tab's title and icon alternate with the note (about once a second) until
+   * the user clicks or types in the page, or presses Done/Keep in the popup;
+   * the background then calls handoffClear. Looking at the tab does not stop it.
    */
-  function handoffNotice(agent, note, blink = false) {
+  function handoffNotice(agent, note) {
     const o = ensureOverlay();
     if (!o) return false;
     clearTimeout(o.timer);
+    o.paused = false;
     o.handoff = true;
     o.text.textContent = `${WORDS[LANG].handoff}: ${note}${agent ? ` — ${agent}` : ""}`;
     o.box.className = "on handoff";
-    const shownAt = Date.now();
-    const done = (event) => {
-      if (!event.isTrusted || Date.now() - shownAt < 1_000) return;
-      removeEventListener("pointerdown", done, true);
-      removeEventListener("keydown", done, true);
-      handoffClear();
-      chrome.runtime.sendMessage({ cmd: "handoffSeen" }).catch(() => {});
-    };
-    o.dismiss = () => {
-      removeEventListener("pointerdown", done, true);
-      removeEventListener("keydown", done, true);
-    };
-    addEventListener("pointerdown", done, true);
-    addEventListener("keydown", done, true);
-    if (blink) startBlink(`🔑 ${WORDS[LANG].handoff}: ${note}`);
+    startBlink(`🔑 ${WORDS[LANG].handoff}: ${note}`);
     return true;
   }
 
-  /** The user is looking at the tab: the title stops alternating, the label stays. */
-  function handoffQuiet() {
-    stopBlink();
-    return true;
-  }
-
-  /** The handover is over (seen and acted on, kept, or taken back by the agent). */
+  /** The handover is over (the user acted, kept it, or the agent took it back). */
   function handoffClear() {
     stopBlink();
-    if (!overlay) return true;
-    overlay.dismiss?.();
+    if (!overlay?.handoff) return true;
     overlay.handoff = false;
+    overlay.box.className = "";
+    return true;
+  }
+
+  /** The user stepped in while the agent worked here: it waits for them. */
+  function paused() {
+    const o = ensureOverlay();
+    if (!o) return false;
+    clearTimeout(o.timer);
+    o.paused = true;
+    o.text.textContent = WORDS[LANG].paused;
+    o.box.className = "on paused";
+    return true;
+  }
+
+  /** The agent carries on here. */
+  function pauseClear() {
+    if (!overlay?.paused) return true;
+    overlay.paused = false;
     overlay.box.className = "";
     return true;
   }
@@ -1157,6 +1174,6 @@
     snapshot, frameSnapshot, element, check, prepareTarget, center: centerOf, blocker, dragPoints, editKind, setValue,
     selectContent, fieldValue, isChecked, isNativeSelect, selectOptions, isFileInput, scrollIntoView, viewport,
     mutations, quietFor, changes, setPrefix, probe, frameOffset, frameBlocker, info, boxIn, readText, frameText, resourceOf, guardSecret,
-    activity, handoffNotice, handoffQuiet, handoffClear, overlayHidden,
+    activity, handoffNotice, handoffClear, paused, pauseClear, overlayHidden,
   };
 })();

@@ -82,6 +82,8 @@ const CAPABILITIES = [
   "browser_downloads",
   "browser_download",
   "browser_tab_handoff",
+  "browser_tab_take",
+  "browser_tab_release",
   "frames",
   "element_screenshot",
 ];
@@ -114,8 +116,20 @@ const state = {
   claims: new Map(),
   /** Tabs showing a badge. */
   badged: new Set(),
-  /** tabId -> { note, agent, sessionId, at, seen }: tabs an agent left to the user. */
+  /** tabId -> { note, agent, sessionId, at }: tabs an agent left to the user. */
   handoffs: new Map(),
+  /** tabId -> { sessionId, kind, at }: agent tabs the user stepped in on (clicked or typed in). */
+  stepIns: new Map(),
+  /**
+   * tabId -> { sessionId, agent, note, from: { windowId, index, groupId, pinned } }:
+   * the user's tabs an agent took to work in. They stay the user's: given back
+   * (never closed) when the agent is done.
+   */
+  taken: new Map(),
+  /** sessionId -> tabId the user took back from it (Give back), reported on its next request. */
+  reclaimed: new Map(),
+  /** tabId -> [start, end] of the agent's last request there: input then is the agent's. */
+  agentWindow: new Map(),
   /** The "AI" tab group of this profile. */
   groupId: null,
   /** tabId -> last time the debugger was used in it. */
@@ -157,7 +171,13 @@ const state = {
 // Persistence and lifecycle
 
 async function persist() {
-  const tabs = { created: [...state.created], handoffs: [...state.handoffs], groupId: state.groupId };
+  const tabs = {
+    created: [...state.created],
+    handoffs: [...state.handoffs],
+    stepIns: [...state.stepIns],
+    taken: [...state.taken],
+    groupId: state.groupId,
+  };
   await Promise.all([
     chrome.storage.session.set({
       pool: [...state.pool],
@@ -182,7 +202,7 @@ function restore() {
 
 async function load() {
   const [saved, local] = await Promise.all([
-    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused", "handoffs", "groupId"]),
+    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused", "handoffs", "stepIns", "taken", "groupId"]),
     chrome.storage.local.get(["port", "autoConnect", "installId", "profile", "agentTabs"]),
   ]);
   // The extension was reloaded: session storage is empty, the local copy is not.
@@ -200,6 +220,8 @@ async function load() {
   for (const tabId of saved.pool ?? []) if (alive.has(tabId)) state.pool.add(tabId);
   for (const [tabId, sessionId] of tabsSaved.created ?? []) if (alive.has(tabId)) state.created.set(tabId, sessionId);
   for (const [tabId, handoff] of tabsSaved.handoffs ?? []) if (alive.has(tabId)) state.handoffs.set(tabId, handoff);
+  for (const [tabId, stepIn] of tabsSaved.stepIns ?? []) if (alive.has(tabId)) state.stepIns.set(tabId, stepIn);
+  for (const [tabId, taken] of tabsSaved.taken ?? []) if (alive.has(tabId)) state.taken.set(tabId, taken);
   if (Number.isInteger(tabsSaved.groupId)) {
     state.groupId = (await chrome.tabGroups?.get(tabsSaved.groupId).catch(() => null)) ? tabsSaved.groupId : null;
   }
@@ -211,7 +233,7 @@ async function load() {
   }
   // Woken up without a server connection while agent tabs are open: they
   // close unless a server answers within the grace period.
-  if (state.lostAt === null && state.created.size) state.lostAt = Date.now();
+  if (state.lostAt === null && (state.created.size || state.taken.size)) state.lostAt = Date.now();
   for (const tab of tabs) noticeClaim(tab.id, tab.url || tab.pendingUrl);
   state.account = await readAccount();
   state.restored = true;
@@ -273,7 +295,7 @@ async function disconnectTab(tabId) {
 /** The user takes over a tab opened for an agent: it stays open and the agent lets go of it. */
 async function keepTab(tabId) {
   await restore();
-  if (state.handoffs.has(tabId)) await handoffSeen(tabId, true);
+  if (state.handoffs.has(tabId)) await handoffSeen(tabId);
   state.created.delete(tabId);
   const sessionId = state.owner.get(tabId);
   if (sessionId) unassign(state.sessions.get(sessionId));
@@ -292,15 +314,17 @@ async function handoffTab(session, tabId, note) {
   if (!mine) {
     throw new Error(`Tab ${tabId} is not one of your tabs. Hand over a tab you opened or work in (browser_tab_list shows them).`);
   }
+  // A tab taken from the user goes back to its place first, then waits for them there.
+  if (state.taken.get(tabId)?.sessionId === session.id) await giveBack(tabId);
   state.created.delete(tabId);
   if (state.owner.get(tabId) === session.id) unassign(session);
   await ungroupTab(tabId);
+  state.stepIns.delete(tabId);
   const tab = await chrome.tabs.get(tabId);
   const window = await chrome.windows.get(tab.windowId).catch(() => null);
-  // The user is looking at it already: no need to call for attention.
-  const looking = tab.active && !!window?.focused;
-  state.handoffs.set(tabId, { note, agent: session.name, sessionId: session.id, at: Date.now(), seen: looking });
-  await runAgent(tabId, 0, "handoffNotice", [session.name, note, !looking]).catch(() => {});
+  state.handoffs.set(tabId, { note, agent: session.name, sessionId: session.id, at: Date.now() });
+  // Blinks even if the user is looking: it stops when they click or type in the page.
+  await runAgent(tabId, 0, "handoffNotice", [session.name, note]).catch(() => {});
   // A window in the background asks for attention once (macOS: one Dock bounce).
   if (window && !window.focused) await chrome.windows.update(window.id, { drawAttention: true }).catch(() => {});
   await persist();
@@ -308,20 +332,144 @@ async function handoffTab(session, tabId, note) {
   return tabInfo(await chrome.tabs.get(tabId), session);
 }
 
-/** The user saw (or acted on) a handed-over tab: its title stops alternating; dismissed, the note goes too. */
-async function handoffSeen(tabId, dismissed) {
-  await restore();
-  const handoff = state.handoffs.get(tabId);
-  if (!handoff) return;
-  if (dismissed) state.handoffs.delete(tabId);
-  else handoff.seen = true;
-  runAgent(tabId, 0, dismissed ? "handoffClear" : "handoffQuiet", []).catch(() => {});
+/**
+ * The agent takes a tab of the user's to work in, where it is, as it is: the
+ * page is not reloaded or copied (a tab in another window is moved, which
+ * keeps it as it is). It joins the AI group; the user is told once and can
+ * give it back. It stays the user's: never closed, given back when done.
+ */
+async function takeTab(session, tabId, note) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (tab && ![...state.handoffs.values()].some((h) => !h.seen)) {
-    await chrome.windows.update(tab.windowId, { drawAttention: false }).catch(() => {});
+  if (!tab) throw new Error(`Tab ${tabId} does not exist (browser_tab_list shows the tabs).`);
+  ensureOwnable(session, tabId);
+  if (state.created.get(tabId) === session.id) throw new Error(`Tab ${tabId} is already yours; browser_tab_select works in it.`);
+  if (state.taken.get(tabId)?.sessionId === session.id) {
+    await assign(session, tabId);
+    return tabInfo(await chrome.tabs.get(tabId), session);
   }
+  const url = tab.url || tab.pendingUrl || "";
+  if (!/^(https?|file):/.test(url)) {
+    throw new Error(`Tab ${tabId} shows ${url || "a browser page"}, which extensions may not control.`);
+  }
+  const from = {
+    windowId: tab.windowId,
+    index: tab.index,
+    pinned: tab.pinned,
+    groupId: tab.groupId !== -1 && tab.groupId !== state.groupId ? tab.groupId : -1,
+  };
+  state.taken.set(tabId, { sessionId: session.id, agent: session.name, note, from });
+  if (state.handoffs.delete(tabId)) runAgent(tabId, 0, "handoffClear", []).catch(() => {});
+  try {
+    await assign(session, tabId);
+  } catch (error) {
+    state.taken.delete(tabId);
+    throw error;
+  }
+  await groupAgentTab(tabId);
   await persist();
   refreshBadges();
+  showActivity(tabId, session, "reading");
+  notifyTaken(tabId, tab.title || url, note);
+  return tabInfo(await chrome.tabs.get(tabId), session);
+}
+
+/** One quiet notification that an agent took a tab, with a way to give it back. */
+function notifyTaken(tabId, title, note) {
+  if (!chrome.notifications) return;
+  const tr = chrome.i18n.getUILanguage().toLowerCase().startsWith("tr");
+  const shortTitle = title.length > 60 ? `${title.slice(0, 59)}…` : title;
+  chrome.notifications
+    .create(`take-${tabId}`, {
+      type: "basic",
+      iconUrl: "icons/128.png",
+      title: "Browser MCP Plus",
+      message: tr ? `AI '${shortTitle}' sekmesini aldı: ${note}` : `AI took the tab '${shortTitle}': ${note}`,
+      buttons: [{ title: tr ? "Geri ver" : "Give back" }],
+      priority: 0,
+      silent: true,
+    })
+    .catch(() => {});
+}
+
+/**
+ * A taken tab goes back to the user: out of the group, to its old window and
+ * place (and its own group, pinned state) when they still exist. Pass
+ * `byUser` when the user asked for it: the agent hears so on its next request.
+ */
+async function giveBack(tabId, { byUser = false } = {}) {
+  await restore();
+  const taken = state.taken.get(tabId);
+  if (!taken) return null;
+  state.taken.delete(tabId);
+  chrome.notifications?.clear(`take-${tabId}`).catch(() => {});
+  const sessionId = state.owner.get(tabId);
+  if (sessionId) unassign(state.sessions.get(sessionId));
+  if (byUser && taken.sessionId) state.reclaimed.set(taken.sessionId, tabId);
+  await withGroupLock(async () => {
+    await ungroupTab(tabId);
+    const { from } = taken;
+    const window = await chrome.windows.get(from.windowId).catch(() => null);
+    if (window) {
+      const count = (await chrome.tabs.query({ windowId: from.windowId })).length;
+      await chrome.tabs.move(tabId, { windowId: from.windowId, index: Math.min(from.index, count) }).catch(() => {});
+      if (from.groupId !== -1 && (await chrome.tabGroups?.get(from.groupId).catch(() => null))) {
+        await chrome.tabs.group({ groupId: from.groupId, tabIds: [tabId] }).catch(() => {});
+      }
+      if (from.pinned) await chrome.tabs.update(tabId, { pinned: true }).catch(() => {});
+    }
+  }).catch(() => {});
+  await persist();
+  refreshBadges();
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  return tab ? tabInfo(tab) : null;
+}
+
+chrome.notifications?.onButtonClicked.addListener((id) => {
+  const tabId = Number(id.replace(/^take-/, ""));
+  if (Number.isInteger(tabId)) void giveBack(tabId, { byUser: true });
+});
+
+chrome.notifications?.onClicked.addListener((id) => {
+  const tabId = Number(id.replace(/^take-/, ""));
+  if (Number.isInteger(tabId)) void focusTab(tabId).catch(() => {});
+});
+
+/**
+ * The handover is over: the user clicked or typed in the page, or pressed
+ * Done/Keep. The note, the blinking and the badge go together; looking at
+ * the tab alone does not end it.
+ */
+async function handoffSeen(tabId) {
+  await restore();
+  if (!state.handoffs.delete(tabId)) return;
+  runAgent(tabId, 0, "handoffClear", []).catch(() => {});
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && !state.handoffs.size) await chrome.windows.update(tab.windowId, { drawAttention: false }).catch(() => {});
+  await persist();
+  refreshBadges();
+}
+
+/** Real input (click or key) the page reported: the agent's own, the user stepping in, or the end of a handover. */
+async function userInput(tabId, kind, at) {
+  await restore();
+  if (state.handoffs.has(tabId)) return handoffSeen(tabId);
+  const sessionId = state.owner.get(tabId);
+  const session = sessionId && state.sessions.get(sessionId);
+  if (!session || state.stepIns.has(tabId)) return;
+  // Input while the agent's request ran in this tab (and a moment after) is the agent's.
+  const [start, end] = state.agentWindow.get(tabId) ?? [0, 0];
+  if ((state.busy.get(tabId) ?? 0) > 0 || (at >= start - 50 && at <= end + 500)) return;
+  state.stepIns.set(tabId, { sessionId, kind, at });
+  runAgent(tabId, 0, "paused", []).catch(() => {});
+  await persist();
+}
+
+function stepInError(tabId) {
+  const stepIn = state.stepIns.get(tabId);
+  const what = stepIn?.kind === "key" ? "typed" : "clicked";
+  return new Error(
+    `The user stepped in on this tab (they ${what} in it), so you are paused here. Stop and ask the user what they want; when they tell you, continue with browser_tab_select (tabId ${tabId}).`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -342,28 +490,68 @@ async function liveGroup() {
   return group;
 }
 
-/** Puts an agent tab in the profile's group, moving it to the group's window if needed. */
+/**
+ * Puts an agent tab (opened or taken by an agent) in the profile's group, at
+ * its end, moving it to the group's window if needed; the group stays at the
+ * right end of the tab strip.
+ */
 function groupAgentTab(tabId) {
   if (!chrome.tabGroups) return Promise.resolve();
   return withGroupLock(async () => {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab || !state.created.has(tabId)) return;
+    if (!tab || !(state.created.has(tabId) || state.taken.has(tabId))) return;
     const window = await chrome.windows.get(tab.windowId).catch(() => null);
     if (window?.type !== "normal") return; // popups cannot hold groups
     const group = await liveGroup();
     if (group && tab.groupId === group.id) return;
+    if (tab.pinned) await chrome.tabs.update(tabId, { pinned: false });
     if (group) {
-      if (group.windowId !== tab.windowId) await chrome.tabs.move(tabId, { windowId: group.windowId, index: -1 });
+      // Moving keeps the page as it is: no reload.
+      await chrome.tabs.move(tabId, { windowId: group.windowId, index: -1 });
       await chrome.tabs.group({ groupId: group.id, tabIds: [tabId] });
-      return;
+    } else {
+      await chrome.tabs.move(tabId, { index: -1 });
+      const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
+      await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
+      state.groupId = groupId;
+      await persist();
     }
-    const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
-    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
-    state.groupId = groupId;
-    await persist();
+    await groupToTheRight();
   }).catch(() => {
     // Grouping is cosmetic.
   });
+}
+
+/** Moves the group, whole, to the right end of its window; the user's tabs keep their order. */
+async function groupToTheRight() {
+  const group = await liveGroup();
+  if (!group) return;
+  const tabs = await chrome.tabs.query({ windowId: group.windowId });
+  const ours = tabs.filter((t) => t.groupId === group.id).map((t) => t.index);
+  const others = tabs.filter((t) => t.groupId !== group.id).map((t) => t.index);
+  if (!ours.length || !others.length || Math.max(...others) < Math.min(...ours)) return;
+  await chrome.tabGroups.move(group.id, { index: -1 });
+}
+
+let rightTimer = null;
+
+/**
+ * After tabs open or move, puts the group back at the right end, calmly: a
+ * second and a half after the last change, and later if the user is still
+ * dragging a tab (Chrome refuses edits meanwhile).
+ */
+function scheduleGroupRight(delay = 1_500) {
+  if (state.groupId === null || !chrome.tabGroups) return;
+  clearTimeout(rightTimer);
+  rightTimer = setTimeout(() => {
+    withGroupLock(groupToTheRight).catch((error) => {
+      if (/drag|cannot be edited/i.test(errorMessage(error))) scheduleGroupRight(2_000);
+    });
+  }, delay);
+}
+
+for (const event of [chrome.tabs.onCreated, chrome.tabs.onMoved, chrome.tabs.onAttached]) {
+  event.addListener(() => scheduleGroupRight());
 }
 
 async function ungroupTab(tabId) {
@@ -432,7 +620,8 @@ function refreshBadges() {
     chrome.action.setBadgeText({ tabId, text }).catch(() => {});
     chrome.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
   }
-  const waiting = [...state.handoffs.values()].filter((h) => !h.seen).length;
+  const waiting = state.handoffs.size;
+  for (const tabId of state.taken.keys()) tabs.add(tabId);
   chrome.action.setBadgeText({ text: waiting ? String(waiting) : "" }).catch(() => {});
   if (waiting) chrome.action.setBadgeBackgroundColor({ color: "#ff9f0a" }).catch(() => {});
   syncNetworkListeners();
@@ -483,6 +672,7 @@ function unassign(session) {
   const tabId = session.tabId;
   state.owner.delete(tabId);
   session.tabId = null;
+  if (state.stepIns.delete(tabId)) runAgent(tabId, 0, "pauseClear", []).catch(() => {});
   // A free tab keeps no debugger attached (and no "is debugging" banner from it).
   void detach(tabId);
   refreshBadges();
@@ -510,6 +700,9 @@ function endSession(session) {
   unassign(session);
   state.sessions.delete(session.id);
   closeAgentTabs((sessionId) => sessionId === session.id);
+  // The user's tabs it took go back where they were, open.
+  for (const [tabId, taken] of [...state.taken]) if (taken.sessionId === session.id) void giveBack(tabId);
+  state.reclaimed.delete(session.id);
 }
 
 function closeAgentTabs(belongs) {
@@ -598,6 +791,7 @@ async function updateSessions({ sessions }) {
     if (!active.has(session.id)) endSession(session);
   }
   closeAgentTabs((sessionId) => !active.has(sessionId));
+  for (const [tabId, taken] of [...state.taken]) if (!active.has(taken.sessionId)) void giveBack(tabId);
   await persist();
   refreshBadges();
   return { ok: true };
@@ -612,6 +806,7 @@ async function checkOrphans() {
   state.lostAt = null;
   for (const session of [...state.sessions.values()]) endSession(session);
   closeAgentTabs(() => true);
+  for (const tabId of [...state.taken.keys()]) void giveBack(tabId);
   await persist();
   refreshBadges();
 }
@@ -799,14 +994,26 @@ async function dispatch(message) {
 async function execute({ type, payload = {} }, session) {
   const handler = handlers[type];
   if (TABLESS.has(type)) return handler(payload, { session, tabId: null });
+  const reclaimed = state.reclaimed.get(session.id);
+  if (reclaimed !== undefined && !QUIET.has(type)) {
+    state.reclaimed.delete(session.id);
+    throw new Error(
+      `The user took tab ${reclaimed} back (Give back). Stop and ask them how to continue; browser_tab_new opens a tab of your own.`,
+    );
+  }
   const tabId = await tabFor(session);
+  // The user stepped in: nothing more happens here until the agent asks and resumes.
+  if (state.stepIns.has(tabId) && !QUIET.has(type)) throw stepInError(tabId);
   if (ACTIVITY[type]) showActivity(tabId, session, ACTIVITY[type]);
   const run = async () => {
     state.busy.set(tabId, (state.busy.get(tabId) ?? 0) + 1);
+    const started = Date.now();
+    state.agentWindow.set(tabId, [started, started]);
     try {
       return await handler(payload, { session, tabId });
     } finally {
       state.busy.set(tabId, state.busy.get(tabId) - 1);
+      state.agentWindow.set(tabId, [started, Date.now()]);
     }
   };
   if (UNQUEUED.has(type)) return run();
@@ -1172,7 +1379,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   state.frameInfo.delete(tabId);
   state.network.delete(tabId);
   state.committedAt.delete(tabId);
-  const handedOff = state.handoffs.delete(tabId);
+  state.stepIns.delete(tabId);
+  state.agentWindow.delete(tabId);
+  const wasTaken = state.taken.delete(tabId);
+  chrome.notifications?.clear(`take-${tabId}`).catch(() => {});
+  const handedOff = state.handoffs.delete(tabId) || wasTaken;
   const pooled = state.pool.delete(tabId);
   const created = state.created.delete(tabId);
   if (handedOff) refreshBadges();
@@ -1220,20 +1431,12 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
 });
 
 // The note on a handed-over page comes back after the user navigates it.
+// A handover note, or the "paused" label, comes back after the page navigates.
 chrome.webNavigation.onCompleted.addListener(({ tabId, frameId }) => {
-  const handoff = frameId === 0 && state.handoffs.get(tabId);
-  if (handoff) runAgent(tabId, 0, "handoffNotice", [handoff.agent, handoff.note, !handoff.seen]).catch(() => {});
-});
-
-// The user switched to a handed-over tab (or to its window): it stops calling for attention.
-chrome.tabs.onActivated.addListener(({ tabId }) => {
-  if (state.handoffs.get(tabId)?.seen === false) void handoffSeen(tabId, false);
-});
-
-chrome.windows.onFocusChanged.addListener(async (windowId) => {
-  if (windowId === chrome.windows.WINDOW_ID_NONE || !state.handoffs.size) return;
-  const [tab] = await chrome.tabs.query({ active: true, windowId }).catch(() => []);
-  if (tab && state.handoffs.get(tab.id)?.seen === false) void handoffSeen(tab.id, false);
+  if (frameId !== 0) return;
+  const handoff = state.handoffs.get(tabId);
+  if (handoff) runAgent(tabId, 0, "handoffNotice", [handoff.agent, handoff.note]).catch(() => {});
+  else if (state.stepIns.has(tabId)) runAgent(tabId, 0, "paused", []).catch(() => {});
 });
 
 chrome.tabGroups?.onRemoved.addListener((group) => {
@@ -1978,8 +2181,10 @@ function tabInfo(tab, session) {
   const openerId = state.created.get(tab.id);
   const agent = state.sessions.get(workerId ?? openerId);
   const handoff = state.handoffs.get(tab.id);
+  const taken = state.taken.get(tab.id);
   let owner = "user";
-  if (agent && agent.id === session?.id) owner = "you";
+  if (taken && taken.sessionId === session?.id) owner = "taken";
+  else if (agent && agent.id === session?.id) owner = "you";
   else if (agent) owner = "agent";
   else if (handoff) owner = "handed-off";
   else if (state.pool.has(tab.id)) owner = "user-connected";
@@ -1994,7 +2199,9 @@ function tabInfo(tab, session) {
     owner,
     ...(agent && agent.id !== session?.id ? { agent: agent.name } : {}),
     ...(handoff ? { note: handoff.note, handedOffBy: handoff.agent } : {}),
+    ...(taken ? { note: taken.note } : {}),
     ...(tab.groupId !== -1 && tab.groupId === state.groupId ? { grouped: true } : {}),
+    ...(state.stepIns.has(tab.id) ? { userSteppedIn: true } : {}),
   };
 }
 
@@ -2403,8 +2610,20 @@ const handlers = {
         `Tab ${target} is the user's own tab. Agents work only in their own tabs and in tabs the user connected (Browser MCP Plus icon → Connect). Open a tab of your own with browser_tab_new.`,
       );
     }
-    if (handedBack) await runAgent(target, 0, "handoffClear", []).catch(() => {});
+    if (handedBack) {
+      // Taken back: the agent's tab again until it hands it over or closes it.
+      state.handoffs.delete(target);
+      state.created.set(target, session.id);
+      await runAgent(target, 0, "handoffClear", []).catch(() => {});
+      refreshBadges();
+    }
     await assign(session, target);
+    if (state.stepIns.get(target)?.sessionId === session.id) {
+      state.stepIns.delete(target);
+      await runAgent(target, 0, "pauseClear", []).catch(() => {});
+    }
+    await persist();
+    if (state.created.get(target) === session.id) await groupAgentTab(target);
     return tabInfo(await chrome.tabs.get(target), session);
   },
 
@@ -2412,6 +2631,11 @@ const handlers = {
     target ??= session.tabId;
     if (target === null || target === undefined) throw new Error("You have no tab to close.");
     ensureOwnable(session, target);
+    if (state.taken.get(target)?.sessionId === session.id) {
+      throw new Error(
+        `Tab ${target} is the user's tab you took to work in, so it stays open. When you are done, give it back with browser_tab_release.`,
+      );
+    }
     if (state.created.get(target) !== session.id) {
       throw new Error(
         `Tab ${target} is not one you opened, so it stays open. Agents close only their own tabs; use browser_tab_handoff to leave a tab to the user.`,
@@ -2424,6 +2648,18 @@ const handlers = {
     // a free connected tab; otherwise a tab is found (or opened) on the next request.
     if (wasCurrent && (await takeFreeTab(session, target))) return tabInfo(await chrome.tabs.get(session.tabId), session);
     return null;
+  },
+
+  async browser_tab_take({ tabId: target, note }, { session }) {
+    return takeTab(session, target, String(note ?? "").slice(0, 120) || "continuing here");
+  },
+
+  async browser_tab_release({ tabId: target }, { session }) {
+    target ??= session.tabId;
+    if (target === null || target === undefined || state.taken.get(target)?.sessionId !== session.id) {
+      throw new Error("That is not a tab you took from the user. browser_tab_list shows them (\"the user's, lent to you\").");
+    }
+    return giveBack(target);
   },
 
   async browser_tab_handoff({ tabId: target, note }, { session }) {
@@ -2441,6 +2677,8 @@ TABLESS.add("browser_tab_new");
 TABLESS.add("browser_tab_select");
 TABLESS.add("browser_tab_close");
 TABLESS.add("browser_tab_handoff");
+TABLESS.add("browser_tab_take");
+TABLESS.add("browser_tab_release");
 TABLESS.add("browser_downloads");
 TABLESS.add("browser_download");
 
@@ -2451,7 +2689,7 @@ async function status() {
   await restore();
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabs = [];
-  for (const tabId of new Set([...state.pool, ...state.created.keys(), ...state.owner.keys()])) {
+  for (const tabId of new Set([...state.pool, ...state.created.keys(), ...state.owner.keys(), ...state.taken.keys()])) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) continue;
     const session = state.sessions.get(state.owner.get(tab.id) ?? state.created.get(tab.id));
@@ -2465,6 +2703,7 @@ async function status() {
       /** Opened for an agent (or by its page): closes when the agent's session ends. */
       openedForAgent: state.created.has(tab.id),
       connectedByUser: state.pool.has(tab.id),
+      taken: state.taken.has(tab.id) ? { note: state.taken.get(tab.id).note, agent: state.taken.get(tab.id).agent } : null,
     });
   }
   // Agents that worked in this profile; the others work in other profiles.
@@ -2485,18 +2724,20 @@ async function status() {
         lastAction: s.lastAction ?? null,
         lastActivity: s.lastActivity ?? null,
         lastError: s.lastError ?? null,
+        pausedByUser: s.tabId !== null && state.stepIns.has(s.tabId),
       };
     });
   const here = active ? tabs.find((t) => t.id === active.id) : undefined;
   const handoffs = [];
   for (const [tabId, handoff] of state.handoffs) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab) handoffs.push({ tabId, title: tab.title ?? "", note: handoff.note, agent: handoff.agent, seen: handoff.seen });
+    if (tab) handoffs.push({ tabId, title: tab.title ?? "", note: handoff.note, agent: handoff.agent });
   }
   const activeHandoff = active ? state.handoffs.get(active.id) : undefined;
   return {
     handoffs,
     activeHandoff: activeHandoff ? { note: activeHandoff.note, agent: activeHandoff.agent } : null,
+    activeTaken: here?.taken ?? null,
     port: state.port,
     version: chrome.runtime.getManifest().version,
     autoConnect: state.autoConnect,
@@ -2521,9 +2762,9 @@ async function focusTab(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // The user acted on a page an agent handed over (from the page agent).
-  if (message?.cmd === "handoffSeen" && sender.tab) {
-    void handoffSeen(sender.tab.id, true);
+  // Real input in a page the agent knows (from the page agent).
+  if (message?.cmd === "userInput" && sender.tab) {
+    void userInput(sender.tab.id, message.kind === "key" ? "key" : "click", Number(message.at) || Date.now());
     return false;
   }
   // A page is about to show (or has closed) a JavaScript dialog (from the page hook).
@@ -2543,7 +2784,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     disconnect: () => (message.tabId ? disconnectTab(message.tabId) : disconnectAll()).then(status),
     disconnectAll: () => disconnectAll().then(status),
     keepTab: () => keepTab(message.tabId).then(status),
-    dismissHandoff: () => handoffSeen(message.tabId, true).then(status),
+    dismissHandoff: () => handoffSeen(message.tabId).then(status),
+    giveBack: () => giveBack(message.tabId, { byUser: true }).then(status),
     resume: () => resume().then(status),
     focusTab: () => focusTab(message.tabId),
     setPort: () => setPort(message.port).then(status),
@@ -2561,6 +2803,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 globalThis.bmcp = {
   connectTab, disconnectTab, disconnectAll, keepTab, resume, setPort, setAutoConnect, status, checkOrphans, handoffSeen,
   sweepDebugger,
+  giveBack,
   /** Tabs this extension's debugger is attached to (Playwright attaches to every tab itself). */
   debuggerTabs: () => [...state.attached],
   /**

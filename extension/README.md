@@ -13,6 +13,7 @@ tool works, and adds what that closed extension cannot do:
 | `browser_profiles` / `browser_profile_select` | List the Chrome profiles and work in another one |
 | `browser_get_text` | The page's readable text, frames included |
 | `browser_tab_handoff` | Leave a tab to the user with a note |
+| `browser_tab_take` / `browser_tab_release` | Work in a tab of the user's, as it is; give it back |
 | `browser_get_file` / `browser_download` / `browser_downloads` | Files and downloads with the browser's logins |
 
 ## Install (unpacked)
@@ -65,11 +66,19 @@ page, since a dialog opened while detached is invisible to CDP.
 
 ## The AI group, the overlay and handing a tab over
 
-Agent tabs share one tab group (`AI`, blue) per profile; new agent tabs open
-in its window. The overlay is a fixed, `pointer-events: none` element with a
-closed shadow root, hidden during screenshots and skipped by the snapshot. A
-handed-over tab leaves the group, shows a note, and alternates its title and
-icon until the user activates it (the background tells the page to stop).
+Agent tabs share one tab group (`AI`, blue) per profile, kept at the right
+end of its window (moved back a moment after the user opens or moves tabs);
+new agent tabs open at its end. The overlay is a fixed, `pointer-events: none`
+element with a closed shadow root, hidden during screenshots and skipped by
+the snapshot.
+
+The page agent reports real (`isTrusted`) clicks and keys with their time;
+the background drops those that fall in the agent's own request window (its
+debugger input is trusted too). In an agent's tab such input pauses the agent
+there until `browser_tab_select`; in a handed-over tab it ends the handover
+(note, blinking title and icon, badge). Taken tabs (`browser_tab_take`) are
+moved with `chrome.tabs.move`, which keeps the page as it is, and remember
+their window, index, pinned state and the user's own group for the way back.
 
 ## Profiles
 

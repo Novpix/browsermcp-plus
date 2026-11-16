@@ -101,6 +101,7 @@ agents use a tab you have open, click the extension icon
 | `browser_scroll` | Scroll by pixels or scroll an element into view |
 | `browser_tab_list` / `_new` / `_select` / `_close` | Work across tabs and windows (`allProfiles` lists every profile); the list says whose each tab is |
 | `browser_tab_handoff` | Leave a tab to the user with a note (sign-in, captcha, approval, a result) |
+| `browser_tab_take` / `browser_tab_release` | Work in one of the user's open tabs, as it is, when they ask; give it back |
 | `browser_get_file` | A PDF, image or any file the browser can reach, with its logins: images inline, every file saved locally |
 | `browser_download` / `browser_downloads` | Download with the browser; list downloads and where they are saved |
 | `browser_profiles` | List the Chrome profiles (folder, name, Google account) and which ones are connected |
@@ -162,11 +163,27 @@ an agent with its own tab, and agents work in parallel:
   unless a server comes back. Tabs you connected never close; to keep a tab an
   agent opened, click the extension icon in it and press **Keep this tab** (or
   **Keep** in the list): the agent lets go of it and it stays yours.
+- **Watch, or step in.** Switching to an agent's tab, scrolling it or moving
+  the mouse over it changes nothing: the agent carries on. Clicking or typing
+  in the page pauses the agent there ("Paused · listening"): its next action in
+  that tab is refused with a request to ask you, and it resumes with
+  `browser_tab_select` once you have told it what you want. The agent's own
+  input and the page's synthetic events never count.
 - **When you have to do something** (sign in, a captcha, an approval, a result
   to look at), the agent hands the tab to you with `browser_tab_handoff`: it
   leaves the group, never closes, says "Your turn: …" in its corner, and its
-  title and icon blink until you switch to it. The toolbar icon counts tabs
-  waiting for you; a window in the background asks for attention once.
+  title and icon blink until you click or type in the page (or press Done in
+  the popup) — looking at it does not stop it. The toolbar icon counts tabs
+  waiting for you; a window in the background asks for attention once. An
+  agent that takes the tab back (`browser_tab_select`) owns it again.
+- **"Continue in that tab."** `browser_tab_take` lets an agent work in one of
+  your open tabs without you touching it: nothing reloads (fields, sign-in and
+  scroll stay), the tab moves into the AI group, and Chrome tells you once,
+  with a **Give back** button (also in the popup). It stays yours: never
+  closed, and back in its old window and place when the agent is done
+  (`browser_tab_release`). Agents take a tab only when you ask them to.
+- The AI group stays at the right end of the tab strip; new agent tabs open at
+  its end, and if you open tabs to its right it moves back, calmly.
 - An agent cannot touch another agent's tab, nor your tabs unless you connect
   them; `browser_tab_list` says whose each tab is.
 - The first server is the hub the extensions connect to; the others join it.

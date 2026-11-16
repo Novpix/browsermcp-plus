@@ -122,6 +122,8 @@ function ownerLabel(tab: TabInfo): string {
       return "the user's, connected for agents — you may use it";
     case "handed-off":
       return `handed to the user${tab.note ? `: ${JSON.stringify(tab.note)}` : ""} — waiting for them`;
+    case "taken":
+      return `the user's, lent to you${tab.note ? `: ${JSON.stringify(tab.note)}` : ""}${tab.connected ? ", you work in it" : ""} — give it back with browser_tab_release`;
     case "user":
       return "the user's — hands off";
     default:
@@ -131,7 +133,12 @@ function ownerLabel(tab: TabInfo): string {
 }
 
 export function formatTab(tab: TabInfo): string {
-  const flags = [ownerLabel(tab), tab.active && "active", tab.grouped && "in the AI group"].filter(Boolean);
+  const flags = [
+    ownerLabel(tab),
+    tab.userSteppedIn && "the user stepped in: ask them, then browser_tab_select to resume",
+    tab.active && "active",
+    tab.grouped && "in the AI group",
+  ].filter(Boolean);
   const suffix = flags.length ? ` (${flags.join(", ")})` : "";
   return `- [${tab.id}] ${tab.title || "(untitled)"} — ${tab.url}${suffix}`;
 }
@@ -169,10 +176,40 @@ export const tabList = defineTool({
   },
 });
 
+export const tabTake = defineTool({
+  name: "browser_tab_take",
+  description:
+    "Take one of the user's open tabs to work in, exactly as it is — page, sign-in, filled fields and scroll stay; nothing reloads. ONLY when the user asked you to work in that tab (e.g. \"continue in that tab\"); find it with browser_tab_list. It joins the AI group and the user is told, with a Give back button. It stays the user's: it is never closed, and goes back to its place with browser_tab_release (or when you finish).",
+  inputSchema: z.object({
+    tabId: z.number().int().describe("The user's tab, from browser_tab_list"),
+    note: z.string().min(1).max(120).describe('What you will do there, short (shown to the user, e.g. "finishing the order")'),
+  }),
+  annotations: NAVIGATION,
+  handle: async (context, { tabId, note }) => {
+    const tab = await context.send("browser_tab_take", { tabId, note });
+    return tabResult(context, `Took tab ${tab.id} (${tab.title || tab.url}) from the user; you work in it now. Give it back with browser_tab_release when you are done`);
+  },
+});
+
+export const tabRelease = defineTool({
+  name: "browser_tab_release",
+  description:
+    "Give a tab you took from the user (browser_tab_take) back: it leaves the AI group and returns to its window and place, open. Without a tabId, your current tab.",
+  inputSchema: z.object({
+    tabId: z.number().int().optional().describe("Tab id from browser_tab_list (default: your current tab)"),
+  }),
+  annotations: NAVIGATION,
+  handle: async (context, { tabId }) => {
+    const tab = await context.send("browser_tab_release", { tabId });
+    const id = tab?.id ?? tabId;
+    return text(`Gave ${id === undefined ? "the tab" : `tab ${id}`} back to the user; it is back where it was.`);
+  },
+});
+
 export const tabHandoff = defineTool({
   name: "browser_tab_handoff",
   description:
-    "Leave a tab to the user when they must act (sign in, solve a captcha, approve, look at a result). The tab stays open after you finish, leaves the AI group, shows your note and blinks in the tab strip until the user looks. Without a tabId, your current tab. browser_tab_select takes it back later.",
+    "Leave a tab to the user when they must act (sign in, solve a captcha, approve, look at a result). The tab stays open after you finish, leaves the AI group, shows your note and blinks in the tab strip until the user clicks or types in it. Without a tabId, your current tab. browser_tab_select takes it back later.",
   inputSchema: z.object({
     note: z.string().min(1).max(120).describe('What the user should do, short (e.g. "sign-in needed")'),
     tabId: z.number().int().optional().describe("Tab id from browser_tab_list (default: your current tab)"),
@@ -181,7 +218,7 @@ export const tabHandoff = defineTool({
   handle: async (context, { note, tabId }) => {
     const tab = await context.send("browser_tab_handoff", { note, tabId });
     return text(
-      `Handed tab ${tab.id} (${tab.title || tab.url}) to the user: ${JSON.stringify(note)}. It stays open after you finish and blinks until the user looks at it. Tell the user what to do there; browser_tab_select takes it back.`,
+      `Handed tab ${tab.id} (${tab.title || tab.url}) to the user: ${JSON.stringify(note)}. It stays open after you finish and blinks until the user clicks or types in it. Tell the user what to do there; browser_tab_select takes it back (then it is yours again).`,
     );
   },
 });
@@ -202,7 +239,8 @@ export const tabNew = defineTool({
 
 export const tabSelect = defineTool({
   name: "browser_tab_select",
-  description: "Work in another tab (ids from browser_tab_list). Tabs used by other agents cannot be selected.",
+  description:
+    "Work in another tab (ids from browser_tab_list): one of yours, one the user connected, one you handed over (it is yours again), or the tab where the user stepped in, to resume after asking them. Tabs of other agents and the user's own tabs cannot be selected.",
   inputSchema: z.object({
     tabId: z.number().int().describe("Tab id from browser_tab_list"),
   }),

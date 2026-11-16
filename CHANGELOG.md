@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.1
+
+The user can watch an agent, stop it with a click, and hand it a tab.
+
+### Added
+
+- **Watch, or step in.** Looking at an agent's tab, scrolling it or moving the
+  mouse changes nothing. A real click or key in the page pauses the agent
+  there ("Paused · listening" / "Durdum · seni dinliyorum"): its next action in
+  that tab is refused with a request to ask the user, and `browser_tab_select`
+  resumes it. The agent's own input and the page's synthetic events do not count.
+- `browser_tab_take` / `browser_tab_release`: work in one of the user's open
+  tabs, only when they ask, without them touching it. Nothing reloads (fields,
+  sign-in, scroll stay), the tab moves into the AI group, and one quiet
+  notification has a **Give back** button (also in the popup). It is never
+  closed: it goes back to its window and place when released or when the
+  agent ends; an agent whose tab the user took back is told so.
+- The AI group stays at the right end of the tab strip; new agent tabs open at
+  its end; it moves back, calmly, after the user opens tabs to its right.
+
+### Changed
+
+- A handed-over tab blinks until the user clicks or types in it (or presses
+  Done/Keep), even while they look at it; note, blinking and badge go together.
+
+### Fixed
+
+- A handed-over tab the agent took back with `browser_tab_select` became
+  nobody's once the agent opened another tab ("the user's — hands off", and
+  `browser_tab_handoff` refused it). It is the agent's again, back in the group.
+
+
 ## 0.7.0
 
 Agents see every frame, read whole pages, and show — quietly — where they work.

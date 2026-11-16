@@ -71,6 +71,10 @@ export type ExtensionMessages = {
   /** Leaves a tab to the user (it stays open, out of the agents' group) with a note. */
   browser_tab_handoff: { payload: { tabId?: number; note: string }; result: TabInfo };
   /** The page's readable text (or one element's), frames included. */
+  /** Takes a tab of the user's to work in, as it is (no reload); it stays theirs. */
+  browser_tab_take: { payload: { tabId: number; note: string }; result: TabInfo };
+  /** Gives a taken tab back to where it was. */
+  browser_tab_release: { payload: { tabId?: number }; result: TabInfo | null };
   browser_get_text: {
     payload: { ref?: string; selector?: string; links?: boolean };
     result: { text: string; url: string; title: string };
@@ -173,14 +177,16 @@ export type TabInfo = {
    * Whose tab it is: you (you opened or work in it), another agent, the user
    * (connected for agents, or not), or the user after an agent handed it over.
    */
-  owner?: "you" | "agent" | "user" | "user-connected" | "handed-off";
-  /** The note of a handed-over tab, and who left it. */
+  owner?: "you" | "agent" | "user" | "user-connected" | "handed-off" | "taken";
+  /** The note of a handed-over (or taken) tab, and who left it. */
   note?: string;
   handedOffBy?: string;
   /** In the agents' tab group. */
   grouped?: boolean;
   /** In the window the user is using. */
   focusedWindow?: boolean;
+  /** The user clicked or typed in it while you worked: you are paused there until browser_tab_select. */
+  userSteppedIn?: boolean;
 };
 
 /** An agent session: one MCP server process, usually one Claude Code session. */
@@ -211,6 +217,8 @@ export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_downloads",
   "browser_download",
   "browser_tab_handoff",
+  "browser_tab_take",
+  "browser_tab_release",
 ]);
 
 /** Sent by the Browser MCP Plus extension right after connecting. */

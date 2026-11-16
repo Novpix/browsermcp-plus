@@ -79,6 +79,8 @@ describe("MCP server", () => {
         "browser_downloads",
         "browser_download",
         "browser_tab_handoff",
+        "browser_tab_take",
+        "browser_tab_release",
       ].sort(),
     );
     for (const tool of tools) {

@@ -494,9 +494,21 @@ describe("tabs, the AI group and handing a tab to the user", () => {
     const attention = await worker.evaluate(() => (globalThis as any).__attention);
     expect(attention.filter((a: any) => a.drawAttention === true).length).toBeLessThanOrEqual(1);
 
-    // The user switches to it: the blinking stops, the page's own title is back.
+    // Switching to the tab does not stop it: the user may just be looking.
+    await page.bringToFront();
     await worker.evaluate((id) => chrome.tabs.update(id, { active: true }), waitingTab);
-    await new Promise((r) => setTimeout(r, 1_300));
+    const looking = new Set<string>();
+    for (let i = 0; i < 15; i++) {
+      looking.add(await page.title());
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect([...looking].some((t) => t.startsWith("🔑 ")), [...looking].join(" | ")).toBe(true);
+    expect(await worker.evaluate(() => chrome.action.getBadgeText({}))).toBe("1");
+
+    // A click in the page ends it: blinking, note and badge together; the page's own title is back.
+    await page.mouse.click(5, 300);
+    await waitFor(async () => (await bmcp<{ handoffs: unknown[] }>("status")).handoffs.length === 0);
+    await new Promise((r) => setTimeout(r, 1_200));
     const after = new Set<string>();
     for (let i = 0; i < 12; i++) {
       after.add(await page.title());
@@ -507,6 +519,8 @@ describe("tabs, the AI group and handing a tab to the user", () => {
       Array.from(document.querySelectorAll("link[rel=icon]")).some((l) => (l as HTMLLinkElement).href.startsWith("data:image/svg")),
     );
     expect(marked).toBe(false);
+    expect(await worker.evaluate(() => chrome.action.getBadgeText({}))).toBe("");
+    expect((await call("alpha", "browser_tab_list")).text).toMatch(new RegExp(`\\[${waitingTab}\\][^\\n]*the user's — hands off`));
     await front.close();
 
     // The agent ends: its own tab closes, the handed-over one stays.
@@ -517,6 +531,117 @@ describe("tabs, the AI group and handing a tab to the user", () => {
       return betaOther.every((id) => !open.includes(id));
     });
     expect(await tabIds()).toContain(waitingTab);
+  });
+
+  it("starts blinking even when the user is looking at the tab", async () => {
+    await call("alpha", "browser_tab_new", { url: `${base}/box.html?looking` });
+    const tabId = await tabOf("alpha");
+    const page = await pageOfTab(/box\.html\?looking/);
+    await page.bringToFront();
+    await worker.evaluate((id) => chrome.tabs.update(id, { active: true }), tabId);
+    await call("alpha", "browser_tab_handoff", { note: "look here" });
+    const titles = new Set<string>();
+    for (let i = 0; i < 15; i++) {
+      titles.add(await page.title());
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect([...titles].some((t) => t.startsWith("🔑 ")), [...titles].join(" | ")).toBe(true);
+    // A key pressed in the page ends it too.
+    await page.keyboard.press("Shift");
+    await waitFor(async () => (await bmcp<{ handoffs: unknown[] }>("status")).handoffs.length === 0);
+  });
+
+  it("takes back a handed-over tab as its own again, even after the user looked at it", async () => {
+    await call("alpha", "browser_tab_new", { url: `${base}/form.html?A` });
+    const a = await tabOf("alpha");
+    await call("alpha", "browser_tab_handoff", { note: "have a look" });
+    // The user looks at it (no click).
+    await worker.evaluate((id) => chrome.tabs.update(id, { active: true }), a);
+    const back = await call("alpha", "browser_tab_select", { tabId: a });
+    expect(back.isError, back.text).toBeFalsy();
+    await call("alpha", "browser_navigate", { url: `${base}/form.html?A2`, snapshot: false });
+    const snap = (await call("alpha", "browser_snapshot")).text;
+    await call("alpha", "browser_type", { element: "Email", ref: ref(snap, /textbox "Email"/), text: "a@example.com" });
+    // Another tab of its own: A stays its own, and in the AI group.
+    await call("alpha", "browser_tab_new", { url: `${base}/page2.html?B` });
+    const list = (await call("alpha", "browser_tab_list")).text;
+    expect(list).toMatch(new RegExp(`\\[${a}\\][^\\n]*\\(yours[^\\n]*in the AI group`));
+    const again = await call("alpha", "browser_tab_handoff", { tabId: a, note: "again" });
+    expect(again.isError, again.text).toBeFalsy();
+    await bmcp("handoffSeen", a);
+  });
+
+  describe("the user watching, and stepping in", () => {
+    let tabId = 0;
+    let page: import("playwright-core").Page;
+    let snap = "";
+    const counter = () => page.textContent("#counter");
+
+    it("lets the user watch: switching to the tab, scrolling and moving the mouse change nothing", async () => {
+      await call("alpha", "browser_tab_new", { url: `${base}/form.html?watch` });
+      tabId = await tabOf("alpha");
+      page = await pageOfTab(/form\.html\?watch/);
+      snap = (await call("alpha", "browser_snapshot")).text;
+      await page.bringToFront();
+      await worker.evaluate((id) => chrome.tabs.update(id, { active: true }), tabId);
+      await page.mouse.move(200, 200);
+      await page.mouse.wheel(0, 400);
+      await page.mouse.move(260, 240);
+      await new Promise((r) => setTimeout(r, 400));
+      const click = await call("alpha", "browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
+      expect(click.isError, click.text).toBeFalsy();
+      expect(await counter()).toBe("Clicked 1x");
+      expect((await call("alpha", "browser_tab_list")).text).toMatch(new RegExp(`\\[${tabId}\\][^\\n]*yours, you work in it[^\\n]*in the AI group`));
+    });
+
+    it("does not count its own input or the page's synthetic events as the user", async () => {
+      await call("alpha", "browser_type", { element: "Email", ref: ref(snap, /textbox "Email"/), text: "me@example.com" });
+      await call("alpha", "browser_press_key", { key: "Tab" });
+      await page.evaluate(() => {
+        document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+      });
+      await new Promise((r) => setTimeout(r, 700));
+      const click = await call("alpha", "browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
+      expect(click.isError, click.text).toBeFalsy();
+      expect(await counter()).toBe("Clicked 2x");
+    });
+
+    it("pauses when the user clicks in its tab, and resumes with browser_tab_select", async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      await page.mouse.click(5, 5);
+      const blocked = await waitFor(async () => {
+        const result = await call("alpha", "browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
+        return result.isError && result;
+      });
+      expect(blocked.text).toContain("The user stepped in on this tab (they clicked in it)");
+      expect(blocked.text).toContain(`browser_tab_select (tabId ${tabId})`);
+      expect(await counter()).toBe("Clicked 2x");
+      expect((await call("alpha", "browser_tab_list")).text).toMatch(/the user stepped in: ask them/);
+      const agents = (await bmcp<{ agents: { name: string; pausedByUser: boolean }[] }>("status")).agents;
+      expect(agents.find((a) => a.name === "alpha")?.pausedByUser).toBe(true);
+      // Still the agent's, still in the group.
+      const tab = await worker.evaluate((id) => chrome.tabs.get(id), tabId);
+      expect(tab.groupId).not.toBe(-1);
+
+      const resumed = await call("alpha", "browser_tab_select", { tabId });
+      expect(resumed.isError, resumed.text).toBeFalsy();
+      const click = await call("alpha", "browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
+      expect(click.isError, click.text).toBeFalsy();
+      expect(await counter()).toBe("Clicked 3x");
+    });
+
+    it("pauses when the user types in its tab", async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      await page.keyboard.press("x");
+      const blocked = await waitFor(async () => {
+        const result = await call("alpha", "browser_snapshot");
+        return result.isError && result;
+      });
+      expect(blocked.text).toContain("(they typed in it)");
+      expect((await call("alpha", "browser_tab_select", { tabId })).isError).toBeFalsy();
+      expect((await call("alpha", "browser_snapshot")).isError).toBeFalsy();
+    });
   });
 
   it("refuses to type a password and says to hand the tab over", async () => {
@@ -531,6 +656,150 @@ describe("tabs, the AI group and handing a tab to the user", () => {
     expect(filled.isError).toBe(true);
     const page = await pageOfTab(/form\.html/);
     expect(await page.inputValue("#password")).toBe("");
+  });
+});
+
+describe("the AI group at the right, and taking the user's tab", () => {
+  /** Ids of a window's tabs in strip order, and the AI group's id. */
+  const strip = (windowId: number) =>
+    worker.evaluate(async (id) => {
+      const tabs = await chrome.tabs.query({ windowId: id });
+      const [group] = await chrome.tabGroups.query({ title: "AI" });
+      return { tabs: tabs.map((t: any) => ({ id: t.id, grouped: !!group && t.groupId === group.id })), groupId: group?.id ?? null };
+    }, windowId) as Promise<{ tabs: { id: number; grouped: boolean }[]; groupId: number | null }>;
+  const groupIsRightmost = (tabs: { grouped: boolean }[]) => {
+    const firstGrouped = tabs.findIndex((t) => t.grouped);
+    return firstGrouped >= 0 && tabs.slice(firstGrouped).every((t) => t.grouped);
+  };
+
+  it("keeps the AI group at the right end, the user's tabs in their order", async () => {
+    await call("alpha", "browser_tab_new", { url: `${base}/page2.html?right` });
+    const agentTab = await tabOf("alpha");
+    const windowId = (await worker.evaluate((id) => chrome.tabs.get(id), agentTab)).windowId;
+    expect(groupIsRightmost((await strip(windowId)).tabs)).toBe(true);
+    const userOrder = (await strip(windowId)).tabs.filter((t) => !t.grouped).map((t) => t.id);
+
+    // The user opens a tab at the end, right of the group.
+    const userTab = await worker.evaluate(async ({ windowId, url }) => (await chrome.tabs.create({ windowId, url, active: false })).id, {
+      windowId,
+      url: `${base}/page2.html?user-right`,
+    });
+    let now = await strip(windowId);
+    expect(now.tabs.at(-1)!.id).toBe(userTab);
+    // Calmly, the group goes back to the right; the user's tabs keep their order.
+    now = await waitFor(async () => {
+      const s = await strip(windowId);
+      return groupIsRightmost(s.tabs) && s;
+    }, 6_000);
+    expect(now.tabs.filter((t) => !t.grouped).map((t) => t.id)).toEqual([...userOrder, userTab]);
+
+    // A new agent tab opens at the group's end.
+    await call("alpha", "browser_tab_new", { url: `${base}/page2.html?right2` });
+    const newest = await tabOf("alpha");
+    now = await strip(windowId);
+    expect(now.tabs.at(-1)!.id).toBe(newest);
+    await worker.evaluate((id) => chrome.tabs.remove(id), userTab);
+  });
+
+  let takenTab = 0;
+  let homeWindow = 0;
+  let homeIndex = 0;
+
+  it("takes the user's tab as it is: no reload, fields and scroll kept, moved into the group", async () => {
+    // The user's tab, in a window of its own, with typed text and a scroll position.
+    const created = await worker.evaluate(async (url) => {
+      const window = await chrome.windows.create({ url, focused: false });
+      await chrome.tabs.create({ windowId: window.id, url: "about:blank", active: false });
+      return { tabId: window.tabs[0].id, windowId: window.id };
+    }, `${base}/article.html?user-tab`);
+    takenTab = created.tabId;
+    homeWindow = created.windowId;
+    const page = await pageOfTab(/article\.html\?user-tab/);
+    await page.waitForLoadState();
+    await page.evaluate(() => {
+      const input = document.createElement("input");
+      input.id = "draft";
+      document.querySelector("h1")!.after(input);
+      input.value = "half-written reply";
+      window.scrollTo(0, 900);
+      (window as any).__sameDocument = "yes";
+    });
+    homeIndex = (await worker.evaluate((id) => chrome.tabs.get(id), takenTab)).index;
+    await worker.evaluate(() => {
+      (globalThis as any).__notes = [];
+      const original = chrome.notifications.create;
+      chrome.notifications.create = (id: string, options: any) => {
+        (globalThis as any).__notes.push({ id, ...options });
+        return original.call(chrome.notifications, id, options);
+      };
+    });
+
+    const listed = (await call("alpha", "browser_tab_list", {})).text;
+    expect(listed).toMatch(new RegExp(`\\[${takenTab}\\][^\\n]*the user's — hands off`));
+    const taken = await call("alpha", "browser_tab_take", { tabId: takenTab, note: "finishing the reply" });
+    expect(taken.isError, taken.text).toBeFalsy();
+    expect(taken.text).toContain("- Page Title: Long article");
+
+    // The same document: nothing reloaded, the field and the scroll are as the user left them.
+    expect(await page.evaluate(() => (window as any).__sameDocument)).toBe("yes");
+    expect(await page.inputValue("#draft")).toBe("half-written reply");
+    expect(await page.evaluate(() => Math.round(window.scrollY))).toBe(900);
+    // Moved into the AI group's window, in the group, at the right.
+    const tab = await worker.evaluate((id) => chrome.tabs.get(id), takenTab);
+    expect(tab.windowId).not.toBe(homeWindow);
+    expect((await strip(tab.windowId)).tabs.find((t) => t.id === takenTab)?.grouped).toBe(true);
+    expect(groupIsRightmost((await strip(tab.windowId)).tabs)).toBe(true);
+    // The user is told once, with a way to give it back.
+    const notes = await worker.evaluate(() => (globalThis as any).__notes);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].message).toMatch(/^(AI took the tab 'Long article': finishing the reply|AI 'Long article' sekmesini aldı: finishing the reply)$/);
+    expect(notes[0].buttons[0].title).toMatch(/^(Give back|Geri ver)$/);
+    // It shows as lent; the agent can act in it.
+    expect((await call("alpha", "browser_tab_list")).text).toMatch(/the user's, lent to you: "finishing the reply", you work in it/);
+    const snap = (await call("alpha", "browser_snapshot")).text;
+    const typed = await call("alpha", "browser_type", { element: "draft", ref: ref(snap, /textbox/), text: "finished reply" });
+    expect(typed.isError, typed.text).toBeFalsy();
+    expect(await page.inputValue("#draft")).toBe("finished reply");
+  });
+
+  it("does not close a taken tab, and gives it back to its place", async () => {
+    const closed = await call("alpha", "browser_tab_close", { tabId: takenTab });
+    expect(closed.isError).toBe(true);
+    expect(closed.text).toContain("browser_tab_release");
+    const released = await call("alpha", "browser_tab_release", {});
+    expect(released.isError, released.text).toBeFalsy();
+    const tab = await worker.evaluate((id) => chrome.tabs.get(id), takenTab);
+    expect([tab.windowId, tab.index, tab.groupId]).toEqual([homeWindow, homeIndex, -1]);
+    const page = await pageOfTab(/article\.html\?user-tab/);
+    expect(await page.evaluate(() => (window as any).__sameDocument)).toBe("yes");
+    expect((await call("alpha", "browser_tab_list")).text).toMatch(new RegExp(`\\[${takenTab}\\][^\\n]*the user's — hands off`));
+  });
+
+  it("gives a taken tab back when the agent ends, and tells it when the user took one back", async () => {
+    await startAgent("tau");
+    expect((await call("tau", "browser_tab_take", { tabId: takenTab, note: "checking" })).isError).toBeFalsy();
+    // The user presses Give back (popup or notification).
+    await bmcp("giveBack", takenTab, { byUser: true });
+    const next = await call("tau", "browser_snapshot");
+    expect(next.isError).toBe(true);
+    expect(next.text).toContain(`The user took tab ${takenTab} back`);
+
+    expect((await call("tau", "browser_tab_take", { tabId: takenTab, note: "checking again" })).isError).toBeFalsy();
+    await stopAgent("tau");
+    await waitFor(async () => (await worker.evaluate((id) => chrome.tabs.get(id), takenTab)).windowId === homeWindow);
+    const tab = await worker.evaluate((id) => chrome.tabs.get(id), takenTab);
+    expect([tab.windowId, tab.groupId]).toEqual([homeWindow, -1]);
+    await worker.evaluate((id) => chrome.windows.remove(id), homeWindow);
+  });
+
+  it("will not take another agent's tab", async () => {
+    await startAgent("omega");
+    await call("omega", "browser_tab_new", { url: `${base}/page2.html?omega` });
+    const omegaTab = await tabOf("omega");
+    const taken = await call("alpha", "browser_tab_take", { tabId: omegaTab, note: "mine now" });
+    expect(taken.isError).toBe(true);
+    expect(taken.text).toContain("being used by another agent (omega)");
+    await stopAgent("omega");
   });
 });
 

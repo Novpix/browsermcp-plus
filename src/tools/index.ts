@@ -1,5 +1,18 @@
 import { download, downloads, getFile } from "./files";
-import { evaluate, fillForm, handleDialog, scroll, tabClose, tabHandoff, tabList, tabNew, tabSelect, uploadFile } from "./plus";
+import {
+  evaluate,
+  fillForm,
+  handleDialog,
+  scroll,
+  tabClose,
+  tabHandoff,
+  tabList,
+  tabNew,
+  tabRelease,
+  tabSelect,
+  tabTake,
+  uploadFile,
+} from "./plus";
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
 import { find, getConsoleLogs, getText, screenshot, snapshot, wait, waitFor } from "./page";
@@ -35,6 +48,8 @@ export const tools: Tool[] = [
   tabSelect,
   tabClose,
   tabHandoff,
+  tabTake,
+  tabRelease,
   getFile,
   downloads,
   download,
