@@ -67,6 +67,16 @@ export type ExtensionMessages = {
   browser_tab_new: { payload: { url?: string }; result: TabInfo };
   browser_tab_select: { payload: { tabId: number }; result: TabInfo };
   browser_tab_close: { payload: { tabId?: number }; result: TabInfo | null };
+  /**
+   * Tells the extension which Chrome profile it runs in (it remembers it), and
+   * hands it the tab opened for an agent while opening that profile.
+   */
+  profile_set: { payload: ProfileSetPayload; result: unknown };
+};
+
+export type ProfileSetPayload = {
+  profile: { directory: string; name: string; userDataDir: string };
+  adopt?: { tabId: number; sessionId: string; sessionName: string };
 };
 
 /** What happened during a page action, reported by the Plus extension. */
@@ -135,6 +145,7 @@ export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_handle_dialog",
   "browser_fill_form",
   "sessions_update",
+  "profile_set",
 ]);
 
 /** Sent by the Browser MCP Plus extension right after connecting. */
@@ -142,7 +153,16 @@ export type ExtensionInfo = {
   name: string;
   version: string;
   capabilities: string[];
+  /** Random id the extension keeps per profile: tells reconnects from other profiles. */
+  installId?: string;
+  /** The Google account signed in to the extension's profile (chrome.identity). */
+  account?: { email?: string; id?: string };
+  /** The profile the hub told this extension earlier. */
+  profile?: { directory?: string; userDataDir?: string; name?: string; email?: string };
 };
+
+/** A message the extension sends on its own (not an answer), e.g. `profile_claim`. */
+export type ExtensionEvent = { type: string; payload: unknown };
 
 /** How long to wait for a `hello` before assuming the original extension. */
 const HELLO_WAIT_MS = 1_000;
@@ -172,6 +192,7 @@ export class ExtensionConnection {
   private closed = false;
   private _info: ExtensionInfo | undefined;
   private announce!: () => void;
+  private readonly listeners = new Set<(event: ExtensionEvent) => void>();
 
   /** Resolves once the extension has introduced itself, or after a short grace period. */
   readonly ready: Promise<void>;
@@ -197,6 +218,11 @@ export class ExtensionConnection {
 
   get isOpen(): boolean {
     return !this.closed && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /** Calls `listener` for messages the extension sends on its own. */
+  onEvent(listener: (event: ExtensionEvent) => void) {
+    this.listeners.add(listener);
   }
 
   request<T extends MessageType>(
@@ -253,6 +279,10 @@ export class ExtensionConnection {
     if (isHello(message)) {
       this._info = message.payload;
       this.announce();
+      return;
+    }
+    if (isEvent(message)) {
+      for (const listener of this.listeners) listener(message);
       return;
     }
     if (!isResponse(message)) return;
@@ -329,6 +359,17 @@ export function isResponse(message: unknown): message is {
     typeof payload === "object" &&
     payload !== null &&
     typeof (payload as { requestId?: unknown }).requestId === "string"
+  );
+}
+
+/** Messages the extension may send unprompted. */
+const EVENT_TYPES = new Set(["profile_claim"]);
+
+function isEvent(message: unknown): message is ExtensionEvent {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    EVENT_TYPES.has((message as { type?: unknown }).type as string)
   );
 }
 

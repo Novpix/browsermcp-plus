@@ -3,6 +3,7 @@ import net from "node:net";
 import { WebSocket } from "ws";
 
 import { EXTENSION_ORIGIN } from "../src/config";
+import type { ExtensionInfo } from "../src/protocol";
 
 /**
  * A port that is free on both IPv4 and IPv6: clients connect to `localhost`,
@@ -54,16 +55,18 @@ export class FakeExtension {
     public handlers: Record<string, Handler> = {},
     /** Capabilities announced in `hello`, like the Browser MCP Plus extension; none = original extension. */
     private readonly capabilities?: string[],
+    /** More of the `hello` payload (install id, account, profile, name); sends a hello even without capabilities. */
+    private readonly hello?: Partial<ExtensionInfo>,
   ) {}
 
   connect(port: number, origin: string | undefined = EXTENSION_ORIGIN): Promise<this> {
     this.ws = new WebSocket(`ws://localhost:${port}`, origin ? { origin } : {});
     this.ws.on("open", () => {
-      if (!this.capabilities) return;
+      if (!this.capabilities && !this.hello) return;
       this.ws.send(
         JSON.stringify({
           type: "hello",
-          payload: { name: "browsermcp-plus", version: "test", capabilities: this.capabilities },
+          payload: { name: "browsermcp-plus", version: "test", capabilities: this.capabilities ?? [], ...this.hello },
         }),
       );
     });
@@ -89,6 +92,11 @@ export class FakeExtension {
         reject(new Error(`HTTP ${res.statusCode}`)),
       );
     });
+  }
+
+  /** Sends a message on the extension's own initiative, e.g. `profile_claim`. */
+  emit(type: string, payload: unknown) {
+    this.ws.send(JSON.stringify({ type, payload }));
   }
 
   close(): Promise<void> {

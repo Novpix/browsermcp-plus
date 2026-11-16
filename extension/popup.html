@@ -310,6 +310,36 @@
         background: rgba(61, 220, 132, 0.1);
         border: 1px solid rgba(61, 220, 132, 0.3);
       }
+      .tab .keep {
+        padding: 2px 8px;
+        font-size: 10.5px;
+        border-radius: 6px;
+      }
+      .notice {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px;
+        margin-bottom: 14px;
+        border-color: rgba(245, 184, 75, 0.35);
+      }
+      [hidden] {
+        display: none !important;
+      }
+      .notice .meta {
+        flex: 1;
+        min-width: 0;
+        color: var(--warn);
+      }
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .check input {
+        width: auto;
+      }
       .empty {
         padding: 12px;
         color: var(--muted);
@@ -384,7 +414,7 @@
       <img src="icons/48.png" alt="" />
       <div>
         <h1>Browser MCP Plus</h1>
-        <div class="version" id="version"></div>
+        <div class="version ellipsis" id="version"></div>
       </div>
       <span class="pill" id="server"><span class="dot"></span><span id="serverText">…</span></span>
     </header>
@@ -407,6 +437,11 @@
       </div>
     </div>
 
+    <div class="plate notice" id="paused" hidden>
+      <div class="meta">Agents are stopped. They can't use this browser until you resume.</div>
+      <button id="resume" class="primary">Resume</button>
+    </div>
+
     <div class="plate current">
       <div class="meta">
         <div class="small muted">This tab</div>
@@ -422,7 +457,7 @@
     </section>
 
     <section>
-      <h2>Connected tabs <span class="count" id="tabHeading"></span></h2>
+      <h2>Tabs <span class="count" id="tabHeading"></span></h2>
       <div class="plate tabs" id="tabs"></div>
     </section>
 
@@ -434,6 +469,10 @@
         <label for="port">Server port</label>
         <input id="port" type="number" min="1" max="65535" />
       </div>
+      <label class="check" title="Off: agents only work in tabs you connect, and in tabs they open from there.">
+        <input id="autoConnect" type="checkbox" />
+        Let agents open tabs of their own
+      </label>
     </details>
 
     <script src="popup.js" type="module"></script>

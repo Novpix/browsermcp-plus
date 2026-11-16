@@ -6,16 +6,28 @@
 // (content/agent.js) for the accessibility snapshot and DOM work.
 //
 // Several agents can work at once. Every request carries the id of the agent
-// session that sent it; each session works in a tab of its own. The tabs the
-// user connected form a pool: a session takes a free one, or gets a new tab
-// next to them when all are busy. Requests for different tabs run in
-// parallel; requests for the same tab run one at a time.
+// session that sent it; each session works in a tab of its own: a free tab
+// the user connected, or a tab opened for it. Tabs opened for a session, and
+// the tabs its pages open, close when the session ends unless the user keeps
+// them. Requests for different tabs run in parallel; requests for the same
+// tab run one at a time.
+//
+// Every Chrome profile runs its own copy of this extension. The server tells
+// them apart by a random install id and the profile's Google account, or by a
+// one-time page it opens in a profile (see noticeClaim).
 
 import { keyEvents } from "./keys.js";
 
 const DEFAULT_PORT = 9009;
-const RECONNECT_MS = 1_000;
+/** Waits between reconnection attempts; the last one repeats. */
+const RECONNECT_MS = [1_000, 1_000, 2_000, 3_000, 5_000];
 const KEEPALIVE_MS = 20_000;
+/**
+ * When the server connection drops without the server saying which sessions
+ * ended (it crashed or was killed), agent tabs close after this long unless a
+ * server comes back and reports its sessions.
+ */
+const ORPHAN_GRACE_MS = 10_000;
 const MAX_CONSOLE_ENTRIES = 1_000;
 /** Below the server's 30 s request timeout, so a stuck request never blocks the queue. */
 const REQUEST_TIMEOUT_MS = 25_000;
@@ -26,7 +38,10 @@ const LOAD_GRACE_MS = 1_500;
 const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
 /** Sessions of servers that predate multi-agent support share this id. */
 const DEFAULT_SESSION = "default";
-const GROUP_COLORS = ["blue", "purple", "cyan", "orange", "pink", "green", "red", "yellow"];
+/** Colours that tell agents apart in the popup. */
+const AGENT_COLORS = ["blue", "purple", "cyan", "orange", "pink", "green", "red", "yellow"];
+/** The page a server opens a Chrome profile with; the token tells the server which profile this is. */
+const CLAIM_URL = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)\/browsermcp-plus\/profile\/([\w-]{16,})(?:[?#].*)?$/;
 
 /** Messages beyond the original extension protocol; announced in `hello`. */
 const CAPABILITIES = [
@@ -40,20 +55,37 @@ const CAPABILITIES = [
   "browser_handle_dialog",
   "browser_fill_form",
   "sessions_update",
+  "profile_set",
 ];
 
 const state = {
   port: DEFAULT_PORT,
+  /** Stay connected to the server without connected tabs, so agents can open their own. */
+  autoConnect: true,
+  /** The user stopped all agents: no server connection until they resume or connect a tab. */
+  paused: false,
   ws: null,
   restored: false,
-  /** Tabs the user connected, plus tabs opened for agents: tabs agents may use. */
+  /** Random id kept per profile; lets the server tell this profile's extension from the others. */
+  installId: null,
+  /** The Google account of this profile (chrome.identity), if any. */
+  account: null,
+  /** { directory, name, userDataDir }: the Chrome profile this runs in, as the server identified it. */
+  profile: null,
+  /** Tabs the user connected. Agents may use them; they never close for an agent. */
   pool: new Set(),
-  /** Tabs this extension opened for agents (grouped and labelled). */
-  created: new Set(),
-  /** sessionId -> { id, name, tabId, color, groupId } */
+  /** tabId -> sessionId: tabs opened for an agent or by its pages. They close when the session ends. */
+  created: new Map(),
+  /** sessionId -> { id, name, tabId, color, ... } */
   sessions: new Map(),
   /** tabId -> sessionId of the agent working in it. */
   owner: new Map(),
+  /** When the server connection was lost while agent tabs were open (ms), else null. */
+  lostAt: null,
+  /** tabId -> token of profile pages not reported to the server yet. */
+  claims: new Map(),
+  /** Tabs showing a badge. */
+  badged: new Set(),
   attached: new Set(),
   /** tabId -> Map(contextId -> context) from Runtime.executionContextCreated. */
   contexts: new Map(),
@@ -77,27 +109,63 @@ async function persist() {
     pool: [...state.pool],
     created: [...state.created],
     sessions: [...state.sessions.values()],
+    lostAt: state.lostAt,
+    paused: state.paused,
   });
 }
 
-async function restore() {
-  if (state.restored) return;
-  state.restored = true;
-  const [saved, { port }] = await Promise.all([
-    chrome.storage.session.get(["pool", "created", "sessions"]),
-    chrome.storage.local.get("port"),
+let restoring = null;
+
+/** Loads the saved state once per service worker start; every entry point awaits it. */
+function restore() {
+  return (restoring ??= load());
+}
+
+async function load() {
+  const [saved, local] = await Promise.all([
+    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused"]),
+    chrome.storage.local.get(["port", "autoConnect", "installId", "profile"]),
   ]);
-  if (Number.isInteger(port)) state.port = port;
-  const alive = new Set((await chrome.tabs.query({})).map((t) => t.id));
+  if (Number.isInteger(local.port)) state.port = local.port;
+  if (typeof local.autoConnect === "boolean") state.autoConnect = local.autoConnect;
+  state.installId = typeof local.installId === "string" ? local.installId : crypto.randomUUID();
+  if (local.installId !== state.installId) await chrome.storage.local.set({ installId: state.installId });
+  if (typeof local.profile?.directory === "string") state.profile = local.profile;
+  state.paused = saved.paused === true;
+  state.lostAt = typeof saved.lostAt === "number" ? saved.lostAt : null;
+
+  const tabs = await chrome.tabs.query({});
+  const alive = new Set(tabs.map((t) => t.id));
   for (const tabId of saved.pool ?? []) if (alive.has(tabId)) state.pool.add(tabId);
-  for (const tabId of saved.created ?? []) if (alive.has(tabId)) state.created.add(tabId);
+  for (const [tabId, sessionId] of saved.created ?? []) if (alive.has(tabId)) state.created.set(tabId, sessionId);
   for (const session of saved.sessions ?? []) {
+    session.busy = 0;
     if (session.tabId !== null && !alive.has(session.tabId)) session.tabId = null;
     state.sessions.set(session.id, session);
     if (session.tabId !== null) state.owner.set(session.tabId, session.id);
   }
+  // Woken up without a server connection while agent tabs are open: they
+  // close unless a server answers within the grace period.
+  if (state.lostAt === null && state.created.size) state.lostAt = Date.now();
+  for (const tab of tabs) noticeClaim(tab.id, tab.url || tab.pendingUrl);
+  state.account = await readAccount();
+  state.restored = true;
   refreshBadges();
   ensureSocket();
+}
+
+/** The profile's Google account, which tells the server which profile this is. */
+function readAccount() {
+  return new Promise((resolve) => {
+    try {
+      chrome.identity.getProfileUserInfo({ accountStatus: "ANY" }, (info) => {
+        void chrome.runtime.lastError;
+        resolve(info?.email || info?.id ? { email: info.email || undefined, id: info.id || undefined } : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
 }
 
 async function tabExists(tabId) {
@@ -113,6 +181,9 @@ async function connectTab(tabId) {
   await attachDebugger(tabId);
   if (!state.attached.has(tabId)) await enableDomains(tabId);
   state.pool.add(tabId);
+  // A tab the user connected is theirs: it never closes with an agent.
+  state.created.delete(tabId);
+  state.paused = false;
   await persist();
   refreshBadges();
   ensureSocket();
@@ -126,40 +197,75 @@ async function disconnectTab(tabId) {
   const sessionId = state.owner.get(tabId);
   if (sessionId) unassign(state.sessions.get(sessionId));
   await detach(tabId);
-  if (!state.pool.size) closeSocket();
+  if (!wantsSocket()) closeSocket();
   await persist();
   refreshBadges();
 }
 
-/** Stops all automation: every tab is released and the server connection closed. */
+/** The user takes over a tab opened for an agent: it stays open and the agent lets go of it. */
+async function keepTab(tabId) {
+  await restore();
+  state.created.delete(tabId);
+  const sessionId = state.owner.get(tabId);
+  if (sessionId) unassign(state.sessions.get(sessionId));
+  await persist();
+  refreshBadges();
+}
+
+/**
+ * Stops all automation: every tab is released, tabs opened for agents stay
+ * open as the user's, and the server connection stays closed until resumed.
+ */
 async function disconnectAll() {
   await restore();
   for (const tabId of [...state.attached]) await detach(tabId);
   for (const session of state.sessions.values()) unassign(session);
+  state.sessions.clear();
   state.pool.clear();
   state.created.clear();
+  state.paused = true;
   closeSocket();
   await persist();
   refreshBadges();
 }
 
+async function resume() {
+  await restore();
+  state.paused = false;
+  await persist();
+  ensureSocket();
+}
+
 async function setPort(port) {
+  await restore();
   state.port = port;
   await chrome.storage.local.set({ port });
   closeSocket();
   ensureSocket();
 }
 
+async function setAutoConnect(value) {
+  await restore();
+  state.autoConnect = !!value;
+  await chrome.storage.local.set({ autoConnect: state.autoConnect });
+  if (wantsSocket()) ensureSocket();
+  else closeSocket();
+}
+
 function shortLabel(name) {
   return (name || "AI").replace(/[^\p{L}\p{N}]/gu, "").slice(0, 3).toUpperCase() || "AI";
 }
 
+/** Badges: the agent's initials on its tabs, ON on free connected tabs. */
 function refreshBadges() {
-  for (const tabId of state.pool) {
-    const session = state.sessions.get(state.owner.get(tabId));
-    const text = session ? shortLabel(session.name) : "ON";
+  const tabs = new Set([...state.pool, ...state.created.keys(), ...state.owner.keys()]);
+  for (const tabId of state.badged) if (!tabs.has(tabId)) clearBadge(tabId);
+  state.badged = tabs;
+  for (const tabId of tabs) {
+    const session = state.sessions.get(state.owner.get(tabId) ?? state.created.get(tabId));
+    const text = session ? shortLabel(session.name) : state.pool.has(tabId) ? "ON" : "AI";
     chrome.action.setBadgeText({ tabId, text }).catch(() => {});
-    chrome.action.setBadgeBackgroundColor({ tabId, color: session ? "#0969da" : "#1a7f37" }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ tabId, color: state.pool.has(tabId) && !session ? "#1a7f37" : "#0969da" }).catch(() => {});
   }
 }
 
@@ -177,8 +283,7 @@ function sessionFor(id, name) {
       id,
       name: name || id,
       tabId: null,
-      color: GROUP_COLORS[state.sessions.size % GROUP_COLORS.length],
-      groupId: null,
+      color: AGENT_COLORS[state.sessions.size % AGENT_COLORS.length],
       actions: 0,
       lastAction: null,
       lastActivity: null,
@@ -192,58 +297,58 @@ function sessionFor(id, name) {
   return session;
 }
 
+/** Tabs opened for the session (or by its pages) that are still open. */
+function createdBy(session) {
+  return [...state.created].filter(([, sessionId]) => sessionId === session.id).map(([tabId]) => tabId);
+}
+
+function ensureOwnable(session, tabId) {
+  const other = state.owner.get(tabId) ?? state.created.get(tabId);
+  if (other && other !== session.id) {
+    throw new Error(`Tab ${tabId} is being used by another agent (${state.sessions.get(other)?.name ?? other}).`);
+  }
+}
+
 function unassign(session) {
   if (!session || session.tabId === null) return;
   const tabId = session.tabId;
   state.owner.delete(tabId);
   session.tabId = null;
-  if (state.created.has(tabId)) chrome.tabs.ungroup(tabId).catch(() => {});
-  if (state.pool.has(tabId)) {
-    // A free tab keeps no debugger attached (and no "is debugging" banner from it).
-    void detach(tabId);
-  } else {
-    void detach(tabId);
-    clearBadge(tabId);
-  }
+  // A free tab keeps no debugger attached (and no "is debugging" banner from it).
+  void detach(tabId);
+  refreshBadges();
 }
 
 /** Gives a session the tab, debugger attached. Fails for tabs that cannot be debugged. */
 async function assign(session, tabId) {
-  const other = state.owner.get(tabId);
-  if (other && other !== session.id) {
-    throw new Error(`Tab ${tabId} is being used by another agent (${state.sessions.get(other)?.name ?? other}).`);
-  }
+  ensureOwnable(session, tabId);
   await attachDebugger(tabId);
   if (!state.attached.has(tabId)) await enableDomains(tabId);
   if (session.tabId !== null && session.tabId !== tabId) unassign(session);
   session.tabId = tabId;
   state.owner.set(tabId, session.id);
-  state.pool.add(tabId);
-  if (state.created.has(tabId)) await groupTab(session, tabId);
   await persist();
   refreshBadges();
 }
 
-async function groupTab(session, tabId) {
-  if (!chrome.tabGroups) return;
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    let groupId = session.groupId;
-    if (groupId !== null) {
-      const group = await chrome.tabGroups.get(groupId).catch(() => null);
-      if (!group || group.windowId !== tab.windowId) groupId = null;
-    }
-    groupId = await chrome.tabs.group({ tabIds: [tabId], ...(groupId === null ? { createProperties: { windowId: tab.windowId } } : { groupId }) });
-    session.groupId = groupId;
-    await chrome.tabGroups.update(groupId, { title: `🤖 ${session.name}`, color: session.color, collapsed: false });
-  } catch {
-    // Grouping is cosmetic.
+/** The session ended: its tabs close, except the ones the user connected or kept. */
+function endSession(session) {
+  unassign(session);
+  state.sessions.delete(session.id);
+  closeAgentTabs((sessionId) => sessionId === session.id);
+}
+
+function closeAgentTabs(belongs) {
+  for (const [tabId, sessionId] of [...state.created]) {
+    if (!belongs(sessionId)) continue;
+    state.created.delete(tabId);
+    chrome.tabs.remove(tabId).catch(() => {});
   }
 }
 
 const claims = new Map();
 
-/** The session's tab: its current one, a free connected tab, or a new tab. */
+/** The session's tab: its current one, another of its own, a free connected tab, or a new tab. */
 function tabFor(session) {
   // Serialized per session so parallel requests don't each open a tab.
   const pending = claims.get(session.id);
@@ -258,47 +363,119 @@ async function claimTab(session) {
     if (await tabExists(session.tabId)) return session.tabId;
     unassign(session);
   }
-  if (!state.pool.size) throw new Error("No tab is connected");
-  for (const tabId of state.pool) {
-    if (state.owner.has(tabId) || !(await tabExists(tabId))) continue;
-    try {
-      await assign(session, tabId);
-      return tabId;
-    } catch {
-      // e.g. a connected tab now showing chrome://: try the next one.
-    }
-  }
-  // Every connected tab is busy: open one for this agent next to them.
+  if (await takeFreeTab(session)) return session.tabId;
+  if (!state.autoConnect && !state.pool.size) throw new Error("No tab is connected");
   const tabId = await openTabFor(session);
   await assign(session, tabId);
   return tabId;
 }
 
-async function openTabFor(session, url) {
-  let anchor = null;
-  for (const tabId of state.pool) {
-    anchor = await chrome.tabs.get(tabId).catch(() => null);
-    if (anchor) break;
+/** Moves the session to another of its own tabs, or a free tab the user connected. */
+async function takeFreeTab(session, except = null) {
+  for (const tabId of [...createdBy(session), ...state.pool]) {
+    if (tabId === except || state.owner.has(tabId) || !(await tabExists(tabId))) continue;
+    try {
+      await assign(session, tabId);
+      return true;
+    } catch {
+      // e.g. a connected tab now showing chrome://: try the next one.
+    }
   }
-  const tab = await chrome.tabs.create({
-    url: url || "about:blank",
-    active: false,
-    ...(anchor ? { windowId: anchor.windowId, index: anchor.index + 1 } : {}),
-  });
-  state.created.add(tab.id);
-  state.pool.add(tab.id);
-  void session;
+  return false;
+}
+
+/** Opens a background tab for the session: next to its other tabs, else in the last used window. */
+async function openTabFor(session, url) {
+  const target = url || "about:blank";
+  const windowId = await windowFor(session);
+  let tab;
+  if (windowId !== null) {
+    tab = await chrome.tabs.create({ url: target, active: false, windowId });
+  } else {
+    // This profile has no window (e.g. it was just opened for the agent).
+    const window = await chrome.windows.create({ url: target, focused: false });
+    tab = window.tabs[0];
+  }
+  state.created.set(tab.id, session.id);
+  await persist();
   return tab.id;
 }
 
-/** Releases the tabs of sessions whose server is gone. */
+async function windowFor(session) {
+  for (const tabId of [session.tabId, ...createdBy(session), ...state.pool]) {
+    if (tabId === null) continue;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const window = tab && (await chrome.windows.get(tab.windowId).catch(() => null));
+    if (window?.type === "normal") return window.id;
+  }
+  const window = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+  return window?.id ?? null;
+}
+
+/** The server's list of live sessions: the tabs of the others close. */
 async function updateSessions({ sessions }) {
   const active = new Set(sessions.map((s) => s.id));
   for (const s of sessions) sessionFor(s.id, s.name);
   for (const session of [...state.sessions.values()]) {
-    if (active.has(session.id)) continue;
-    unassign(session);
-    state.sessions.delete(session.id);
+    if (!active.has(session.id)) endSession(session);
+  }
+  closeAgentTabs((sessionId) => !active.has(sessionId));
+  await persist();
+  refreshBadges();
+  return { ok: true };
+}
+
+/** The server went away and did not come back: every agent tab closes. */
+async function checkOrphans() {
+  await restore();
+  // Connected, or still trying: the server decides.
+  if (state.ws && state.ws.readyState <= WebSocket.OPEN) return;
+  if (state.lostAt === null || Date.now() - state.lostAt < ORPHAN_GRACE_MS) return;
+  state.lostAt = null;
+  for (const session of [...state.sessions.values()]) endSession(session);
+  closeAgentTabs(() => true);
+  await persist();
+  refreshBadges();
+}
+
+function markLost() {
+  if (state.lostAt === null) state.lostAt = Date.now();
+  void persist();
+  setTimeout(() => void checkOrphans(), ORPHAN_GRACE_MS + 250);
+}
+
+// ---------------------------------------------------------------------------
+// Chrome profiles
+
+/**
+ * A server that opens this profile loads its one-time page here; reporting
+ * the token tells it which connection runs in the profile. The server answers
+ * with profile_set, which also hands this tab to the agent that asked.
+ */
+function noticeClaim(tabId, url) {
+  const match = url && CLAIM_URL.exec(url);
+  if (!match || Number(match[1]) !== state.port) return;
+  state.claims.set(tabId, match[2]);
+  flushClaims();
+  ensureSocket();
+}
+
+function flushClaims() {
+  const ws = state.ws;
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  for (const [tabId, token] of state.claims) send(ws, { type: "profile_claim", payload: { token, tabId } });
+  state.claims.clear();
+}
+
+async function setProfile({ profile, adopt }) {
+  state.profile = profile;
+  await chrome.storage.local.set({ profile });
+  if (adopt && (await tabExists(adopt.tabId))) {
+    const session = sessionFor(adopt.sessionId, adopt.sessionName);
+    state.created.set(adopt.tabId, session.id);
+    await chrome.tabs.update(adopt.tabId, { url: "about:blank" }).catch(() => {});
+    await waitForDocument(adopt.tabId);
+    await assign(session, adopt.tabId).catch(() => {});
   }
   await persist();
   refreshBadges();
@@ -309,38 +486,60 @@ async function updateSessions({ sessions }) {
 // WebSocket connection to the MCP server
 
 let reconnectTimer = null;
-let keepaliveTimer = null;
+let attempts = 0;
+
+function wantsSocket() {
+  return !state.paused && (state.autoConnect || state.pool.size > 0 || state.created.size > 0 || state.claims.size > 0);
+}
 
 function ensureSocket() {
-  if (!state.pool.size) return;
+  if (!state.restored || !wantsSocket()) return;
   if (state.ws && state.ws.readyState <= WebSocket.OPEN) return;
   clearTimeout(reconnectTimer);
 
   const ws = new WebSocket(`ws://localhost:${state.port}`);
   state.ws = ws;
+  let opened = false;
+  let keepalive = null;
 
   ws.onopen = () => {
-    send(ws, {
-      type: "hello",
-      payload: {
-        name: "browsermcp-plus",
-        version: chrome.runtime.getManifest().version,
-        capabilities: CAPABILITIES,
-      },
-    });
-    clearInterval(keepaliveTimer);
+    opened = true;
+    attempts = 0;
+    // The server reports its sessions shortly; it decides which agent tabs stay.
+    state.lostAt = null;
+    void persist();
+    send(ws, { type: "hello", payload: helloPayload() });
+    flushClaims();
     // Socket traffic keeps the MV3 service worker alive while connected.
-    keepaliveTimer = setInterval(() => send(ws, { type: "ping" }), KEEPALIVE_MS);
+    keepalive = setInterval(() => send(ws, { type: "ping" }), KEEPALIVE_MS);
   };
 
   ws.onmessage = (event) => onServerMessage(ws, event.data);
 
   ws.onclose = () => {
-    clearInterval(keepaliveTimer);
+    clearInterval(keepalive);
     if (state.ws === ws) state.ws = null;
-    if (state.pool.size) reconnectTimer = setTimeout(ensureSocket, RECONNECT_MS);
+    // A newer socket replaced this one (e.g. the port changed): it decides.
+    if (state.ws) return;
+    if (opened) markLost();
+    else void checkOrphans();
+    if (wantsSocket()) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(ensureSocket, RECONNECT_MS[Math.min(attempts++, RECONNECT_MS.length - 1)]);
+    }
   };
   ws.onerror = () => {};
+}
+
+function helloPayload() {
+  return {
+    name: "browsermcp-plus",
+    version: chrome.runtime.getManifest().version,
+    capabilities: CAPABILITIES,
+    installId: state.installId,
+    ...(state.account ? { account: state.account } : {}),
+    ...(state.profile ? { profile: state.profile } : {}),
+  };
 }
 
 function closeSocket() {
@@ -354,12 +553,18 @@ function send(ws, message) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
 }
 
-// Wakes the worker periodically so it reconnects after the server restarts.
+// Wakes the worker periodically so it reconnects after the server restarts,
+// and closes agent tabs a vanished server left behind.
 chrome.alarms?.create("reconnect", { periodInMinutes: 0.5 });
-chrome.alarms?.onAlarm.addListener(() => restore().then(ensureSocket));
+chrome.alarms?.onAlarm.addListener(() =>
+  restore().then(() => {
+    ensureSocket();
+    void checkOrphans();
+  }),
+);
 
 /** Messages that don't act in a tab. */
-const TABLESS = new Set(["browser_wait", "browser_tab_list", "sessions_update"]);
+const TABLESS = new Set(["browser_wait", "browser_tab_list", "sessions_update", "profile_set"]);
 /** Reads that never touch the page, so they need not wait for the tab's queue. */
 const UNQUEUED = new Set(["getUrl", "getTitle", "browser_get_console_logs"]);
 
@@ -387,7 +592,7 @@ async function onServerMessage(ws, data) {
 }
 
 /** Messages that are bookkeeping rather than something an agent did. */
-const QUIET = new Set(["getUrl", "getTitle", "sessions_update"]);
+const QUIET = new Set(["getUrl", "getTitle", "sessions_update", "profile_set"]);
 
 async function dispatch(message) {
   await restore();
@@ -603,19 +808,34 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   state.consoleLogs.delete(tabId);
   state.dialogs.delete(tabId);
   state.queues.delete(tabId);
-  state.created.delete(tabId);
-  if (state.pool.delete(tabId)) {
-    if (!state.pool.size) closeSocket();
+  state.claims.delete(tabId);
+  state.badged.delete(tabId);
+  const pooled = state.pool.delete(tabId);
+  const created = state.created.delete(tabId);
+  if (pooled || created || sessionId) {
+    if (!wantsSocket()) closeSocket();
     void persist();
   }
 });
 
-chrome.tabs.onCreated.addListener((tab) => {
-  if (tab.openerTabId !== undefined) state.opened.get(tab.openerTabId)?.push(tab.id);
+// A page opened a tab or window (a link to a new tab, window.open). Unlike a
+// tab's openerTabId, which Chrome sets to the window's active tab when a
+// background tab opens one, sourceTabId names the tab that really did.
+chrome.webNavigation.onCreatedNavigationTarget.addListener(({ sourceTabId, tabId }) => {
+  void restore().then(() => {
+    state.opened.get(sourceTabId)?.push(tabId);
+    // The agent working in (or owning) the source tab owns the new one: it closes with the agent.
+    const sessionId = state.owner.get(sourceTabId) ?? state.created.get(sourceTabId);
+    if (!sessionId || state.created.has(tabId) || state.pool.has(tabId)) return;
+    state.created.set(tabId, sessionId);
+    void persist();
+    refreshBadges();
+  });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === "loading" && state.consoleLogs.has(tabId)) state.consoleLogs.set(tabId, []);
+  if (info.url) noticeClaim(tabId, info.url);
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,7 +1250,7 @@ function sleep(ms) {
 // Message handlers. Each gets the payload and { session, tabId }.
 
 function tabInfo(tab, session) {
-  const owner = state.sessions.get(state.owner.get(tab.id));
+  const owner = state.sessions.get(state.owner.get(tab.id) ?? state.created.get(tab.id));
   return {
     id: tab.id,
     windowId: tab.windowId,
@@ -1038,16 +1258,9 @@ function tabInfo(tab, session) {
     // A tab that is still loading has an empty url and the target in pendingUrl.
     url: tab.url || tab.pendingUrl || "",
     active: tab.active,
-    connected: !!session && owner?.id === session.id,
+    connected: !!session && state.owner.get(tab.id) === session.id,
     ...(owner && owner.id !== session?.id ? { agent: owner.name } : {}),
   };
-}
-
-function ensureOwnable(session, tabId) {
-  const other = state.owner.get(tabId);
-  if (other && other !== session.id) {
-    throw new Error(`Tab ${tabId} is being used by another agent (${state.sessions.get(other)?.name ?? other}).`);
-  }
 }
 
 const handlers = {
@@ -1215,51 +1428,38 @@ const handlers = {
   },
 
   async browser_tab_new({ url }, { session }) {
+    // The tab is the agent's even if it cannot be controlled (e.g. chrome://): it closes with the agent.
     const tabId = await openTabFor(session, url);
-    try {
-      await assign(session, tabId);
-    } catch (error) {
-      // e.g. chrome:// pages: the tab stays open for the user but is not for agents.
-      state.pool.delete(tabId);
-      state.created.delete(tabId);
-      await persist();
-      throw error;
-    }
+    await assign(session, tabId);
     if (url) await waitForDocument(tabId);
     return tabInfo(await chrome.tabs.get(tabId), session);
   },
 
   async browser_tab_select({ tabId: target }, { session }) {
-    ensureOwnable(session, target);
     await assign(session, target);
     return tabInfo(await chrome.tabs.get(target), session);
   },
 
-  async browser_tab_close({ tabId: target }, { session, tabId }) {
-    target ??= tabId;
+  async browser_tab_close({ tabId: target }, { session }) {
+    target ??= session.tabId;
+    if (target === null || target === undefined) throw new Error("You have no tab to close.");
     ensureOwnable(session, target);
     if (target === session.tabId) unassign(session);
     await chrome.tabs.remove(target);
-    // Carry on in a free connected tab if there is one; otherwise a tab is
-    // found (or opened) on the next request.
-    for (const candidate of state.pool) {
-      if (state.owner.has(candidate) || !(await tabExists(candidate))) continue;
-      try {
-        await assign(session, candidate);
-        return tabInfo(await chrome.tabs.get(candidate), session);
-      } catch {
-        // try the next one
-      }
-    }
+    // Carry on in another tab of this agent's, or a free connected tab;
+    // otherwise a tab is found (or opened) on the next request.
+    if (await takeFreeTab(session, target)) return tabInfo(await chrome.tabs.get(session.tabId), session);
     return null;
   },
 
   sessions_update: updateSessions,
+  profile_set: setProfile,
 };
 
 // The agent's tab is resolved in dispatch(); these handlers use the session instead.
 TABLESS.add("browser_tab_new");
 TABLESS.add("browser_tab_select");
+TABLESS.add("browser_tab_close");
 
 // ---------------------------------------------------------------------------
 // Popup and test hooks
@@ -1268,10 +1468,10 @@ async function status() {
   await restore();
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabs = [];
-  for (const tabId of state.pool) {
+  for (const tabId of new Set([...state.pool, ...state.created.keys(), ...state.owner.keys()])) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) continue;
-    const session = state.sessions.get(state.owner.get(tab.id));
+    const session = state.sessions.get(state.owner.get(tab.id) ?? state.created.get(tab.id));
     tabs.push({
       id: tab.id,
       title: tab.title ?? "",
@@ -1279,11 +1479,14 @@ async function status() {
       favIconUrl: tab.favIconUrl ?? "",
       agent: session?.name ?? null,
       color: session?.color ?? null,
+      /** Opened for an agent (or by its page): closes when the agent's session ends. */
       openedForAgent: state.created.has(tab.id),
+      connectedByUser: state.pool.has(tab.id),
     });
   }
+  // Agents that worked in this profile; the others work in other profiles.
   const agents = [...state.sessions.values()]
-    .filter((s) => s.id !== DEFAULT_SESSION || s.actions)
+    .filter((s) => s.actions || s.tabId !== null || createdBy(s).length > 0)
     .map((s) => {
       const tab = tabs.find((t) => t.id === s.tabId);
       return {
@@ -1293,6 +1496,7 @@ async function status() {
         tabId: s.tabId,
         tabTitle: tab?.title ?? null,
         tabUrl: tab?.url ?? null,
+        tabCount: createdBy(s).length,
         busy: (s.busy ?? 0) > 0,
         actions: s.actions ?? 0,
         lastAction: s.lastAction ?? null,
@@ -1300,11 +1504,18 @@ async function status() {
         lastError: s.lastError ?? null,
       };
     });
+  const here = active ? tabs.find((t) => t.id === active.id) : undefined;
   return {
     port: state.port,
     version: chrome.runtime.getManifest().version,
+    autoConnect: state.autoConnect,
+    paused: state.paused,
+    profile: state.profile,
+    account: state.account?.email ?? null,
     activeTabId: active?.id ?? null,
     activeConnected: active ? state.pool.has(active.id) : false,
+    /** The active tab was opened for an agent: the popup offers to keep it. */
+    activeAgentTab: here?.openedForAgent ? { agent: here.agent } : null,
     activeRestricted: !active?.url || !/^(https?|file):/.test(active.url),
     tabs,
     agents,
@@ -1324,8 +1535,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     connect: () => connectTab(message.tabId).then(status),
     disconnect: () => (message.tabId ? disconnectTab(message.tabId) : disconnectAll()).then(status),
     disconnectAll: () => disconnectAll().then(status),
+    keepTab: () => keepTab(message.tabId).then(status),
+    resume: () => resume().then(status),
     focusTab: () => focusTab(message.tabId),
     setPort: () => setPort(message.port).then(status),
+    setAutoConnect: () => setAutoConnect(message.value).then(status),
   };
   const action = actions[message?.cmd];
   if (!action) return false;
@@ -1336,6 +1550,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-globalThis.bmcp = { connectTab, disconnectTab, disconnectAll, setPort, status };
+globalThis.bmcp = { connectTab, disconnectTab, disconnectAll, keepTab, resume, setPort, setAutoConnect, status, checkOrphans };
 
 void restore();

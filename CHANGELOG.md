@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.6.0
+
+Agents clean up after themselves, and can work in any Chrome profile.
+
+### Added
+
+- **Tabs close when the agent is done.** Tabs opened for an agent, and the
+  tabs its pages open, close when its session ends: right away when the
+  server exits normally, after 10 s when it dies without a word and no server
+  comes back. Tabs you connected never close. **Keep this tab** in the popup
+  (or **Keep** next to a tab) hands a tab to you: it stays open and the agent
+  lets go of it.
+- **Chrome profiles.** `browser_profiles` lists the profiles from Chrome's
+  `Local State` (folder, name, Google account) and which ones are connected;
+  `browser_profile_select` switches the agent to another profile and opens a
+  Chrome window for it if needed. Every profile's extension connects to the
+  hub, which tells them apart by the profile's account, or by a one-time page
+  it opens in a profile without one (the extension remembers the answer).
+  New options: `--profile`, `--chrome-user-data-dir`, `--chrome-path`.
+- The extension connects to the server by itself, so agents can start without
+  a connected tab (turn off "Let agents open tabs of their own" in the popup
+  for the old behaviour). **Stop all** now keeps agents out until **Resume**.
+
+### Changed
+
+- No more tab groups: agent tabs are marked by the agent's initials on the
+  extension icon. The `tabGroups` permission is gone; `identity`,
+  `identity.email` (the profile's account) and `webNavigation` (tabs a page
+  opens) are new.
+- Tabs a page opens are attributed to the tab that really opened them; for an
+  agent working in a background tab they were missing from action reports.
+- Servers only join a hub that marks itself as browsermcp-plus 0.6+, so they
+  no longer join another program on the port (e.g. Tabrein MCP). The hub
+  refuses Tabrein MCP sessions and extensions that are not Browser MCP Plus,
+  and logs such rejections once instead of every second.
+- The extension backs off up to 5 s between reconnection attempts.
+
+
 ## 0.5.0
 
 Several agents can now use the browser at the same time, each in its own tab.

@@ -2,6 +2,7 @@ import { evaluate, fillForm, handleDialog, scroll, tabClose, tabList, tabNew, ta
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
 import { find, getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
+import { profileSelect, profiles } from "./profiles";
 import type { Tool } from "./tool";
 
 export const tools: Tool[] = [
@@ -31,4 +32,7 @@ export const tools: Tool[] = [
   tabNew,
   tabSelect,
   tabClose,
+  // Chrome profiles: work with another Google account.
+  profiles,
+  profileSelect,
 ];

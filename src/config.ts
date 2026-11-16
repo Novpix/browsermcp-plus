@@ -56,14 +56,40 @@ export const SESSION_HEADER = "x-browsermcp-session";
 export const SESSION_NAME_HEADER = "x-browsermcp-session-name";
 
 /**
+ * Sent by a browsermcp-plus hub (0.6+) on every HTTP and WebSocket response, so
+ * other servers only join a hub that speaks this protocol and not another
+ * browser server holding the same port (e.g. Tabrein MCP, a fork of this one).
+ */
+export const HUB_HEADER = "x-browsermcp-plus-hub";
+export const HUB_PROTOCOL = 1;
+
+/** Join requests from Tabrein MCP servers carry this header; they cannot share our hub. */
+export const TABREIN_HUB_HEADER = "x-tabrein-hub-revision";
+
+/**
+ * Opening a Chrome profile loads this hub URL in it; the profile's extension
+ * sees the token and tells the hub which profile it runs in.
+ */
+export const PROFILE_CLAIM_PATH = "/browsermcp-plus/profile/";
+
+/** How long browser_profile_select waits for a profile's extension after opening it. */
+export const PROFILE_OPEN_TIMEOUT_MS = 20_000;
+
+/**
  * How long the hub waits after a change before telling the extension which
  * sessions are alive; lets sessions rejoin after the hub moved without losing
  * their tabs.
  */
 export const SESSIONS_UPDATE_DELAY_MS = 1_500;
 
+/**
+ * A new hub waits at least this long before its first sessions update, so the
+ * sessions of a hub that exited can rejoin before the extension closes their tabs.
+ */
+export const HUB_SETTLE_MS = 3_000;
+
 /** Close code used to acknowledge a takeover request. */
 export const TAKEOVER_ACK_CODE = 4001;
 
 export const NO_CONNECTION_MESSAGE =
-  "No connection to the browser extension. Click the Browser MCP Plus (or Browser MCP) icon in the browser toolbar and press 'Connect' on the tab you want to automate.";
+  "No connection to the browser extension. Open Chrome with the Browser MCP Plus extension turned on: it connects by itself (unless it was paused or set to connected tabs only in its popup). With the original Browser MCP extension, click its toolbar icon and press 'Connect'.";

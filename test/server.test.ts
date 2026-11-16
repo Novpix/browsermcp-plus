@@ -72,6 +72,8 @@ describe("MCP server", () => {
         "browser_tab_new",
         "browser_tab_select",
         "browser_tab_close",
+        "browser_profiles",
+        "browser_profile_select",
       ].sort(),
     );
     for (const tool of tools) {

@@ -124,7 +124,7 @@ function formatTab(tab: TabInfo): string {
 export const tabList = defineTool({
   name: "browser_tab_list",
   description:
-    "List open browser tabs. Your tab is marked connected; tabs used by other agents are marked and cannot be selected.",
+    "List the open tabs of your Chrome profile. Your tab is marked connected; tabs of other agents are marked and cannot be selected.",
   inputSchema: z.object({}),
   annotations: READ_ONLY,
   handle: async (context) => {
@@ -135,7 +135,8 @@ export const tabList = defineTool({
 
 export const tabNew = defineTool({
   name: "browser_tab_new",
-  description: "Open a new tab, optionally at a URL, and make it the connected tab",
+  description:
+    "Open a tab of your own, optionally at a URL, and work in it. Tabs you open (and tabs their pages open) close when your session ends, unless the user keeps them.",
   inputSchema: z.object({
     url: z.string().min(1).optional().describe("URL to open (default about:blank)"),
   }),
@@ -162,7 +163,7 @@ export const tabSelect = defineTool({
 export const tabClose = defineTool({
   name: "browser_tab_close",
   description:
-    "Close a tab (default: the connected one). Closing the connected tab connects the tab that becomes active.",
+    "Close a tab (default: yours). After closing your tab you continue in another tab of yours, or a new one on your next action.",
   inputSchema: z.object({
     tabId: z.number().int().optional().describe("Tab id from browser_tab_list"),
   }),

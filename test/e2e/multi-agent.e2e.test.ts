@@ -1,4 +1,5 @@
-// Several agents (MCP server processes) sharing one browser, each in its own tab.
+// Several agents (MCP server processes) sharing one browser, each in tabs of
+// its own that close when the agent is done.
 
 /// <reference lib="dom" />
 declare const chrome: any;
@@ -24,18 +25,24 @@ let context: BrowserContext;
 let worker: Worker;
 let port: number;
 const agents: Record<string, Client> = {};
+const transports: Record<string, StdioClientTransport> = {};
 
 async function startAgent(name: string): Promise<Client> {
   const client = new Client({ name, version: "0" });
-  await client.connect(
-    new StdioClientTransport({
-      command: process.execPath,
-      args: [path.join(root, "dist/index.js"), "--port", String(port), "--session-name", name],
-      stderr: process.env.DEBUG ? "inherit" : "ignore",
-    }),
-  );
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(root, "dist/index.js"), "--port", String(port), "--session-name", name],
+    stderr: process.env.DEBUG ? "inherit" : "ignore",
+  });
+  await client.connect(transport);
   agents[name] = client;
+  transports[name] = transport;
   return client;
+}
+
+async function stopAgent(name: string) {
+  await agents[name].close();
+  delete agents[name];
 }
 
 async function call(agent: string, name: string, args: Record<string, unknown> = {}) {
@@ -48,11 +55,17 @@ async function call(agent: string, name: string, args: Record<string, unknown> =
 
 const extensionStatus = () =>
   worker.evaluate(() => (globalThis as unknown as { bmcp: any }).bmcp.status()) as Promise<{
-    tabs: { id: number; title: string; agent: string | null }[];
+    tabs: { id: number; title: string; url: string; agent: string | null; openedForAgent: boolean; connectedByUser: boolean }[];
     serverConnected: boolean;
   }>;
 
 const tabCount = async () => (await context.pages()).length;
+
+const openTabIds = () => worker.evaluate(async () => (await chrome.tabs.query({})).map((t: { id: number }) => t.id)) as Promise<number[]>;
+
+const agentTabs = async (agent: string) => (await extensionStatus()).tabs.filter((t) => t.agent === agent).map((t) => t.id);
+
+let userTab: number;
 
 async function waitFor(condition: () => Promise<boolean>, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
@@ -91,11 +104,12 @@ beforeAll(async () => {
   await startAgent("beta");
 
   // The user connects one tab.
-  await worker.evaluate(async ({ port }) => {
+  userTab = await worker.evaluate(async ({ port }) => {
     const [tab] = await chrome.tabs.query({ active: true });
     const api = (globalThis as unknown as { bmcp: any }).bmcp;
     await api.setPort(port);
     await api.connectTab(tab.id);
+    return tab.id;
   }, { port });
   await waitFor(async () => (await extensionStatus()).serverConnected);
 }, 60_000);
@@ -121,9 +135,11 @@ describe("several agents in one browser", () => {
     expect(status.tabs.map((t) => t.agent).sort()).toEqual(["alpha", "beta"]);
   });
 
-  it("puts tabs opened for an agent in a labelled group", async () => {
-    const groups = await worker.evaluate(() => chrome.tabGroups.query({}));
-    expect(groups.map((g: { title: string }) => g.title)).toContain("🤖 beta");
+  it("does not put the tabs it opens in a tab group", async () => {
+    const [betaTab] = await agentTabs("beta");
+    const tab = await worker.evaluate((id) => chrome.tabs.get(id), betaTab);
+    expect(tab.groupId).toBe(-1);
+    expect(await worker.evaluate(() => typeof chrome.tabGroups)).toBe("undefined");
   });
 
   it("each agent sees and drives only its own tab, in parallel", async () => {
@@ -157,32 +173,79 @@ describe("several agents in one browser", () => {
     expect(closed.isError).toBe(true);
   });
 
-  it("frees an agent's tab when it exits and reuses it for the next agent", async () => {
-    await agents.beta.close();
-    delete agents.beta;
-    await waitFor(async () => !(await extensionStatus()).tabs.some((t) => t.agent === "beta"));
+  it("closes an agent's tabs when it exits, also the ones its page opened, and leaves the user's tab", async () => {
+    const nav = await call("beta", "browser_navigate", { url: `${siteUrl}/actions.html` });
+    expect(nav.isError, nav.text).toBeFalsy();
+    const link = /link "Open help in new tab" \[ref=([^\]]+)\]/.exec(nav.text)![1];
+    const click = await call("beta", "browser_click", { element: "help link", ref: link });
+    expect(click.isError, click.text).toBeFalsy();
+    // Reported even though the agent works in a background tab.
+    expect(click.text).toMatch(/New tab opened: \[\d+\]/);
+    await waitFor(async () => (await agentTabs("beta")).length === 2);
+    const betaTabs = await agentTabs("beta");
 
-    const before = await tabCount();
+    await stopAgent("beta");
+    await waitFor(async () => {
+      const open = await openTabIds();
+      return betaTabs.every((id) => !open.includes(id));
+    });
+    expect(await openTabIds()).toContain(userTab);
+    expect((await extensionStatus()).tabs.some((t) => t.agent === "beta")).toBe(false);
+  });
+
+  it("leaves a tab the user kept", async () => {
     await startAgent("gamma");
-    const g = await call("gamma", "browser_snapshot");
-    expect(g.isError, g.text).toBeFalsy();
-    // gamma got beta's old tab rather than a new one.
-    expect(g.text).toContain("- Page Title: Second page");
-    expect(await tabCount()).toBe(before);
+    const opened = await call("gamma", "browser_tab_new", { url: `${siteUrl}/page2.html` });
+    expect(opened.isError, opened.text).toBeFalsy();
+    const kept = Number(/Opened tab (\d+)/.exec(opened.text)![1]);
+    await worker.evaluate((id) => (globalThis as unknown as { bmcp: any }).bmcp.keepTab(id), kept);
+    expect((await extensionStatus()).tabs.some((t) => t.id === kept)).toBe(false);
+
+    // The agent let go of the kept tab and carries on in a new one.
+    const nav = await call("gamma", "browser_navigate", { url: `${siteUrl}/form.html`, snapshot: false });
+    expect(nav.isError, nav.text).toBeFalsy();
+    const [gammaTab] = await agentTabs("gamma");
+    expect(gammaTab).not.toBe(kept);
+
+    await stopAgent("gamma");
+    await waitFor(async () => !(await openTabIds()).includes(gammaTab));
+    expect(await openTabIds()).toContain(kept);
+    await worker.evaluate((id) => chrome.tabs.remove(id), kept);
   });
 
   it("keeps working when the hub agent exits", async () => {
-    await agents.alpha.close();
-    delete agents.alpha;
-    // gamma becomes the hub and the extension reconnects to it.
-    let result = await call("gamma", "browser_snapshot");
+    await startAgent("delta");
+    const nav = await call("delta", "browser_navigate", { url: `${siteUrl}/page2.html`, snapshot: false });
+    expect(nav.isError, nav.text).toBeFalsy();
+    const [deltaTab] = await agentTabs("delta");
+    expect(deltaTab).not.toBe(userTab);
+
+    await stopAgent("alpha");
+    // delta becomes the hub and the extension reconnects to it.
+    let result = await call("delta", "browser_snapshot");
     const deadline = Date.now() + 10_000;
     while (result.isError && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 300));
-      result = await call("gamma", "browser_snapshot");
+      result = await call("delta", "browser_snapshot");
     }
     expect(result.isError, result.text).toBeFalsy();
     expect(result.text).toContain("- Page Title: Second page");
     await waitFor(async () => !(await extensionStatus()).tabs.some((t) => t.agent === "alpha"));
+    // The new hub reported delta as alive: its tab stayed; the user's tab is free again.
+    await new Promise((r) => setTimeout(r, 4_000));
+    expect(await agentTabs("delta")).toEqual([deltaTab]);
+    const user = (await extensionStatus()).tabs.find((t) => t.id === userTab);
+    expect(user).toMatchObject({ agent: null, connectedByUser: true });
   });
+
+  it("closes the tabs of a server that died without a word, after a grace period", async () => {
+    const [deltaTab] = await agentTabs("delta");
+    process.kill(transports.delta.pid!, "SIGKILL");
+    delete agents.delta;
+    await new Promise((r) => setTimeout(r, 3_000));
+    // Not yet: a server might come back.
+    expect(await openTabIds()).toContain(deltaTab);
+    await waitFor(async () => !(await openTabIds()).includes(deltaTab), 20_000);
+    expect(await openTabIds()).toContain(userTab);
+  }, 30_000);
 });

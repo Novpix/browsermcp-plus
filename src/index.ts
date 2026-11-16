@@ -44,6 +44,15 @@ const program = new Command()
     "--session-name <name>",
     "name shown for this agent in the browser (default: the current folder's name)",
   )
+  .option(
+    "--profile <name>",
+    "Chrome profile to work in until browser_profile_select picks another: folder (\"Profile 3\"), name or account email (default: the profile Chrome used last)",
+  )
+  .option(
+    "--chrome-user-data-dir <path>",
+    "Chrome's user data directory, whose Local State lists the profiles (default: Google Chrome's)",
+  )
+  .option("--chrome-path <path>", "Chrome executable used to open profiles (default: Google Chrome)")
   .option("--no-takeover", "do not share the browser with a server that is already running")
   .option(
     "--kill-existing",
@@ -72,6 +81,9 @@ const program = new Command()
 type CliOptions = {
   port: number;
   sessionName?: string;
+  profile?: string;
+  chromeUserDataDir?: string;
+  chromePath?: string;
   allowOrigin: string[];
   takeover: boolean;
   killExisting: boolean;
@@ -94,6 +106,9 @@ async function main() {
       name: options.sessionName || path.basename(process.cwd()) || "agent",
     },
     allowedOrigins: [...DEFAULT_ALLOWED_ORIGINS, ...options.allowOrigin],
+    profile: options.profile,
+    chromeUserDataDir: options.chromeUserDataDir && path.resolve(options.chromeUserDataDir),
+    chromePath: options.chromePath,
     takeover: options.takeover,
     killExisting: options.killExisting,
     requestTimeoutMs: options.requestTimeout,

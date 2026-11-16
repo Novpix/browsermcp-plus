@@ -1,7 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
-/** Chrome tab-group colours, lightened for the dark popup. */
-const GROUP_COLORS = {
+/** Agent colours, lightened for the dark popup. */
+const AGENT_COLORS = {
   grey: "#bdc1c6",
   blue: "#8ab4f8",
   red: "#f28b82",
@@ -49,16 +49,23 @@ function host(url) {
 }
 
 function render(status) {
-  $("version").textContent = `v${status.version}`;
+  const profile = status.profile?.name || status.account;
+  $("version").textContent = `v${status.version}${profile ? ` · ${profile}` : ""}`;
+  $("version").title = status.profile ? `Chrome profile folder: ${status.profile.directory}` : "";
 
   // Server pill
   const server = $("server");
-  server.className = `pill ${status.serverConnected ? "ok" : status.tabs.length ? "warn" : ""}`;
+  const waiting = !status.paused && (status.autoConnect || status.tabs.length > 0);
+  server.className = `pill ${status.serverConnected ? "ok" : waiting ? "warn" : ""}`;
   $("serverText").textContent = status.serverConnected
     ? "Connected"
-    : status.tabs.length
-      ? "Waiting for server"
-      : "Off";
+    : status.paused
+      ? "Stopped"
+      : waiting
+        ? "Waiting for server"
+        : "Off";
+  $("paused").hidden = !status.paused;
+  $("resume").onclick = () => run(() => call("resume"));
 
   // Stats
   const working = status.agents.filter((a) => a.busy).length;
@@ -66,26 +73,39 @@ function render(status) {
   $("agentCount").textContent = status.agents.length;
   $("agentSub").textContent = working ? `${working} working` : status.agents.length ? "all idle" : "none yet";
   $("tabCount").textContent = status.tabs.length;
-  $("tabSub").textContent = status.tabs.length ? `${free} free` : "connected";
+  const opened = status.tabs.filter((t) => t.openedForAgent).length;
+  $("tabSub").textContent = status.tabs.length ? `${opened} opened · ${free} free` : "none";
   $("portValue").textContent = status.port;
 
   // This tab
   const here = status.activeConnected;
-  $("currentText").textContent = here
-    ? "Connected — agents may use it"
-    : status.activeRestricted
-      ? "This page can't be automated"
-      : "Not connected";
+  const agentTab = status.activeAgentTab;
   const toggle = $("toggle");
-  toggle.textContent = here ? "Disconnect" : "Connect";
-  toggle.className = here ? "" : "primary";
-  toggle.disabled = !here && status.activeRestricted;
-  toggle.onclick = () => run(() => call(here ? "disconnect" : "connect", { tabId: status.activeTabId }));
+  if (agentTab) {
+    // Opened for an agent: it closes when the agent is done, unless the user keeps it.
+    $("currentText").textContent = `${agentTab.agent ? `Opened by ${agentTab.agent}` : "Opened by an agent"} — closes when it is done`;
+    toggle.textContent = "Keep this tab";
+    toggle.className = "primary";
+    toggle.disabled = false;
+    toggle.title = "The tab stays open and becomes yours; the agent lets go of it.";
+    toggle.onclick = () => run(() => call("keepTab", { tabId: status.activeTabId }));
+  } else {
+    $("currentText").textContent = here
+      ? "Connected — agents may use it"
+      : status.activeRestricted
+        ? "This page can't be automated"
+        : "Not connected";
+    toggle.textContent = here ? "Disconnect" : "Connect";
+    toggle.className = here ? "" : "primary";
+    toggle.disabled = !here && status.activeRestricted;
+    toggle.title = here ? "" : "Let agents work in this tab too";
+    toggle.onclick = () => run(() => call(here ? "disconnect" : "connect", { tabId: status.activeTabId }));
+  }
 
   // Agents
   $("agentHeading").textContent = status.agents.length ? `· ${status.agents.length}` : "";
   const agents = status.agents.map((agent) => {
-    const color = GROUP_COLORS[agent.color] ?? GROUP_COLORS.blue;
+    const color = AGENT_COLORS[agent.color] ?? AGENT_COLORS.blue;
     const card = el(
       "button",
       {
@@ -108,7 +128,9 @@ function render(status) {
         el("span", {
           class: "ellipsis",
           style: { flex: "1", minWidth: "0" },
-          textContent: agent.tabId ? `▸ ${agent.tabTitle || host(agent.tabUrl) || `Tab ${agent.tabId}`}` : "No tab yet",
+          textContent: agent.tabId
+            ? `▸ ${agent.tabTitle || host(agent.tabUrl) || `Tab ${agent.tabId}`}${agent.tabCount > 1 ? ` +${agent.tabCount - 1}` : ""}`
+            : "No tab yet",
         }),
         agent.lastAction && el("span", { class: "chip", textContent: agent.busy ? `${agent.lastAction}…` : agent.lastAction }),
         el("span", { textContent: agent.busy ? "working" : ago(agent.lastActivity) }),
@@ -126,7 +148,7 @@ function render(status) {
             { class: "plate empty" },
             "No agents yet. Start Claude Code (or any MCP client) with ",
             el("code", { textContent: "browsermcp-plus" }),
-            " — each session appears here and works in its own tab.",
+            " — each session appears here and works in tabs of its own, which close when it is done.",
           ),
         ]),
   );
@@ -140,19 +162,34 @@ function render(status) {
       tab.favIconUrl ? el("img", { src: tab.favIconUrl, alt: "" }) : el("span", { class: "noicon" }),
       el("span", { class: "title ellipsis", title: tab.url, textContent: tab.title || host(tab.url) || `Tab ${tab.id}` }),
       tab.agent
-        ? el("span", { class: "owner", "--agent": GROUP_COLORS[tab.color] ?? GROUP_COLORS.blue, textContent: tab.agent })
+        ? el("span", { class: "owner", "--agent": AGENT_COLORS[tab.color] ?? AGENT_COLORS.blue, textContent: tab.agent })
         : el("span", { class: "owner free", textContent: "free" }),
+      tab.openedForAgent &&
+        el("button", {
+          class: "keep",
+          textContent: "Keep",
+          title: "Keep this tab open after the agent is done; the agent lets go of it",
+          onclick: () => run(() => call("keepTab", { tabId: tab.id })),
+        }),
     ),
   );
   $("tabs").replaceChildren(
     ...(tabs.length
       ? tabs
-      : [el("div", { class: "empty", textContent: "Connect a tab to let agents use your browser. Agents open more tabs when they need them." })]),
+      : [
+          el("div", {
+            class: "empty",
+            textContent: status.autoConnect
+              ? "Agents open tabs of their own here and close them when they are done. Connect a tab to let them use it too."
+              : "Connect a tab to let agents use your browser.",
+          }),
+        ]),
   );
 
-  $("stopAll").hidden = status.tabs.length === 0;
+  $("stopAll").hidden = status.paused || (status.tabs.length === 0 && status.agents.length === 0);
   $("stopAll").onclick = () => run(() => call("disconnectAll"));
   if (document.activeElement !== $("port")) $("port").value = status.port;
+  $("autoConnect").checked = status.autoConnect;
 }
 
 async function run(action) {
@@ -168,6 +205,8 @@ $("port").addEventListener("change", () => {
   const port = Number($("port").value);
   if (Number.isInteger(port) && port > 0 && port < 65536) run(() => call("setPort", { port }));
 });
+
+$("autoConnect").addEventListener("change", () => run(() => call("setAutoConnect", { value: $("autoConnect").checked })));
 
 run(() => call("status"));
 setInterval(() => run(() => call("status")), 1000);

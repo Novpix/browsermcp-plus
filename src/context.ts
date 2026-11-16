@@ -26,7 +26,7 @@ export class Context {
   readonly actionSnapshots: boolean;
 
   constructor(
-    private readonly bridge: ExtensionBridge,
+    readonly bridge: ExtensionBridge,
     options: ContextOptions = {},
   ) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;

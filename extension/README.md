@@ -10,6 +10,7 @@ tool works, and adds what that closed extension cannot do:
 | `browser_evaluate` | Run JavaScript in the page's own world, optionally with an element from the snapshot |
 | `browser_scroll` | Mouse-wheel scrolling by pixels, or scroll an element into view |
 | `browser_tab_list` / `browser_tab_new` / `browser_tab_select` / `browser_tab_close` | Work across tabs |
+| `browser_profiles` / `browser_profile_select` | List the Chrome profiles and work in another one |
 
 ## Install (unpacked)
 
@@ -18,27 +19,43 @@ tool works, and adds what that closed extension cannot do:
    `browsermcp-plus-extension-*.zip` from a release).
 3. **Disable the original Browser MCP extension** — both would compete for the
    same server connection.
-4. Open the tab you want to automate, click the toolbar icon (or press
-   <kbd>Alt</kbd>+<kbd>J</kbd>) and press **Connect**. The icon shows an `ON`
-   badge on the connected tab.
+4. Repeat in every Chrome profile agents should use. The extension connects
+   to the server by itself; to let agents use one of your tabs too, click the
+   toolbar icon (or press <kbd>Alt</kbd>+<kbd>J</kbd>) in it and press
+   **Connect**. The icon shows an `ON` badge on the connected tab.
 
 The extension ID is pinned by the manifest `key`
 (`kjcoeimgiimkjbeeblldadmlebheajgb`) and allowed by the server by default.
 
 ## Several agents
 
-Requests carry the agent session that sent them. The tabs you connect form a
-pool; each session takes a free one or gets a new tab (grouped and labelled
-with its name) when all are busy, and requests for different tabs run in
-parallel. Tabs an agent works in get focus emulation, because Chrome stops
-processing input in hidden tabs. The popup lists agents, their tabs and
-activity.
+Requests carry the agent session that sent them. Each session takes a free
+tab you connected or opens a background tab of its own, and requests for
+different tabs run in parallel. Tabs an agent works in get focus emulation,
+because Chrome stops processing input in hidden tabs. The popup lists agents,
+their tabs and activity.
+
+Tabs opened for a session, and the tabs its pages open (found through
+`webNavigation.onCreatedNavigationTarget`, since a background tab's
+`openerTabId` names the window's active tab instead), close when the server
+reports that the session ended, or 10 s after the server connection drops if
+no server comes back. **Keep this tab** in the popup takes a tab out of that.
+
+## Profiles
+
+The `hello` message carries a random install id (kept per profile), the
+profile's Google account (`chrome.identity.getProfileUserInfo`) and the
+profile folder the server told it earlier (`profile_set`). A server that opens
+a profile loads `http://127.0.0.1:<port>/browsermcp-plus/profile/<token>` in
+it; the extension reports the token (`profile_claim`), and the server answers
+with `profile_set`, which also hands that tab to the agent.
 
 ## How it works
 
 - `background.js` keeps a WebSocket to `ws://localhost:9009` (configurable in
-  the popup) while a tab is connected, reconnecting automatically; a keepalive
-  and a periodic alarm keep the MV3 service worker from going stale.
+  the popup), reconnecting automatically; a keepalive and a periodic alarm
+  keep the MV3 service worker from going stale. With "Let agents open tabs of
+  their own" turned off it connects only while a tab is connected.
 - Pointer and keyboard input is dispatched with the debugger API
   (`Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText`,
   intercepted HTML5 drags), so pages receive trusted events. Chrome shows its
