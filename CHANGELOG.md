@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.2
+
+Agents work in the background: the tab you are looking at stays in front.
+
+### Fixed
+
+- Giving back a taken tab the user had switched to, to watch, moved it to its
+  own window and left the AI group's window showing an agent's tab. It now
+  stays where the user is looking at it (the agent is told so).
+- Taking the tab a window shows (the user is looking at it) from another
+  window moved it into the AI group and left that window showing another tab.
+  It now stays there, in front; it still is the agent's to work in.
+- A link the agent opened in a new tab (`target=_blank`) came to the front.
+  It now opens behind: the window shows again what it showed. Links the user
+  clicks open as usual.
+- Moving and grouping tabs (opening agent tabs, taking, giving back, putting
+  the AI group back at the right) restore any window that came to show a
+  moved tab, so no Chrome version can shift the user's screen this way.
+
+### Docs
+
+- A disclaimer in the README (agents act as you; no warranty, no liability)
+  and a security policy (`SECURITY.md`) for reporting vulnerabilities.
+
 ## 0.7.1
 
 The user can watch an agent, stop it with a click, and hand it a tab.

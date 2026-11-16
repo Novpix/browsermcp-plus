@@ -132,6 +132,13 @@ const state = {
   agentWindow: new Map(),
   /** The "AI" tab group of this profile. */
   groupId: null,
+  /**
+   * windowId -> ids of the tabs the window showed, most recent first: what to
+   * show again when an agent's tab comes to the front by itself.
+   */
+  shown: new Map(),
+  /** tabId -> when an agent's page opened it (a link to a new tab), while it may still come to the front. */
+  openedByAgent: new Map(),
   /** tabId -> last time the debugger was used in it. */
   cdpUsedAt: new Map(),
   /** tabId -> requests running in it (its debugger stays attached meanwhile). */
@@ -202,7 +209,7 @@ function restore() {
 
 async function load() {
   const [saved, local] = await Promise.all([
-    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused", "handoffs", "stepIns", "taken", "groupId"]),
+    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused", "handoffs", "stepIns", "taken", "groupId", "shown"]),
     chrome.storage.local.get(["port", "autoConnect", "installId", "profile", "agentTabs"]),
   ]);
   // The extension was reloaded: session storage is empty, the local copy is not.
@@ -225,6 +232,11 @@ async function load() {
   if (Number.isInteger(tabsSaved.groupId)) {
     state.groupId = (await chrome.tabGroups?.get(tabsSaved.groupId).catch(() => null)) ? tabsSaved.groupId : null;
   }
+  for (const [windowId, ids] of saved.shown ?? []) {
+    const kept = ids.filter((id) => alive.has(id));
+    if (kept.length) state.shown.set(windowId, kept);
+  }
+  for (const tab of tabs) if (tab.active && !state.shown.has(tab.windowId)) state.shown.set(tab.windowId, [tab.id]);
   for (const session of saved.sessions ?? []) {
     session.busy = 0;
     if (session.tabId !== null && !alive.has(session.tabId)) session.tabId = null;
@@ -335,8 +347,10 @@ async function handoffTab(session, tabId, note) {
 /**
  * The agent takes a tab of the user's to work in, where it is, as it is: the
  * page is not reloaded or copied (a tab in another window is moved, which
- * keeps it as it is). It joins the AI group; the user is told once and can
- * give it back. It stays the user's: never closed, given back when done.
+ * keeps it as it is). It joins the AI group, unless the user is looking at it
+ * in another window: then it stays there, in front. No window shows another
+ * tab because of it. The user is told once and can give it back. It stays
+ * the user's: never closed, given back when done.
  */
 async function takeTab(session, tabId, note) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -393,8 +407,10 @@ function notifyTaken(tabId, title, note) {
 
 /**
  * A taken tab goes back to the user: out of the group, to its old window and
- * place (and its own group, pinned state) when they still exist. Pass
- * `byUser` when the user asked for it: the agent hears so on its next request.
+ * place (and its own group, pinned state) when they still exist. A tab the
+ * user is looking at in another window than its own stays there, in front.
+ * Pass `byUser` when the user asked for it: the agent hears so on its next
+ * request. The result says whether the tab stayed in front (`keptInFront`).
  */
 async function giveBack(tabId, { byUser = false } = {}) {
   await restore();
@@ -405,23 +421,31 @@ async function giveBack(tabId, { byUser = false } = {}) {
   const sessionId = state.owner.get(tabId);
   if (sessionId) unassign(state.sessions.get(sessionId));
   if (byUser && taken.sessionId) state.reclaimed.set(taken.sessionId, tabId);
+  let keptInFront = false;
   await withGroupLock(async () => {
     await ungroupTab(tabId);
     const { from } = taken;
-    const window = await chrome.windows.get(from.windowId).catch(() => null);
-    if (window) {
-      const count = (await chrome.tabs.query({ windowId: from.windowId })).length;
-      await chrome.tabs.move(tabId, { windowId: from.windowId, index: Math.min(from.index, count) }).catch(() => {});
-      if (from.groupId !== -1 && (await chrome.tabGroups?.get(from.groupId).catch(() => null))) {
-        await chrome.tabs.group({ groupId: from.groupId, tabIds: [tabId] }).catch(() => {});
-      }
-      if (from.pinned) await chrome.tabs.update(tabId, { pinned: true }).catch(() => {});
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return;
+    // Moving it to its window would leave this one showing another tab.
+    if (tab.active && tab.windowId !== from.windowId) {
+      keptInFront = true;
+      return;
     }
+    const window = await chrome.windows.get(from.windowId).catch(() => null);
+    if (!window) return;
+    const count = (await chrome.tabs.query({ windowId: from.windowId })).length;
+    await chrome.tabs.move(tabId, { windowId: from.windowId, index: Math.min(from.index, count) }).catch(() => {});
+    if (from.groupId !== -1 && (await chrome.tabGroups?.get(from.groupId).catch(() => null))) {
+      await chrome.tabs.group({ groupId: from.groupId, tabIds: [tabId] }).catch(() => {});
+    }
+    if (from.pinned) await chrome.tabs.update(tabId, { pinned: true }).catch(() => {});
+    return [tabId];
   }).catch(() => {});
   await persist();
   refreshBadges();
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  return tab ? tabInfo(tab) : null;
+  return tab ? { ...tabInfo(tab), ...(keptInFront ? { keptInFront } : {}) } : null;
 }
 
 chrome.notifications?.onButtonClicked.addListener((id) => {
@@ -477,11 +501,79 @@ function stepInError(tabId) {
 
 let groupLock = Promise.resolve();
 
+/** Changes to the tab strip (moving, grouping), one at a time, none changing what the user sees. */
 function withGroupLock(fn) {
+  return serialized(() => keepingView(fn));
+}
+
+function serialized(fn) {
   const run = groupLock.then(fn, fn);
   groupLock = run.catch(() => {});
   return run;
 }
+
+/**
+ * Runs a change to the tab strip without changing what the user sees. `fn`
+ * returns the ids of the tabs it moved; a window that came to show one of
+ * them meanwhile (Chrome may show a tab moved into a window) shows its tab
+ * again. Tabs the user brings to the front meanwhile stay. (Moving the shown
+ * tab out of a window would make Chrome show a neighbour: callers don't.)
+ */
+async function keepingView(fn) {
+  const before = new Map((await chrome.tabs.query({ active: true }).catch(() => [])).map((t) => [t.windowId, t.id]));
+  let moved = [];
+  try {
+    moved = (await fn()) ?? [];
+    return moved;
+  } finally {
+    for (const tab of moved.length ? await chrome.tabs.query({ active: true }).catch(() => []) : []) {
+      const was = before.get(tab.windowId);
+      if (was === undefined || was === tab.id || !moved.includes(tab.id)) continue;
+      const wasTab = await chrome.tabs.get(was).catch(() => null);
+      if (wasTab?.windowId === tab.windowId) await chrome.tabs.update(was, { active: true }).catch(() => {});
+    }
+  }
+}
+
+const SHOWN_KEPT = 8;
+
+/** The user (or Chrome) brought a tab to the front: remembered per window. */
+async function noticeShown(tabId, windowId) {
+  await restore();
+  const ids = (state.shown.get(windowId) ?? []).filter((id) => id !== tabId);
+  state.shown.set(windowId, [tabId, ...ids].slice(0, SHOWN_KEPT));
+  await chrome.storage.session.set({ shown: [...state.shown] }).catch(() => {});
+  // Opened in front by an agent's page a moment ago: it goes behind.
+  const opened = state.openedByAgent.get(tabId);
+  if (opened !== undefined && Date.now() - opened < 2_000) await keepBehind(tabId);
+}
+
+/**
+ * An agent's page opened a tab in front (a link to a new tab; Chrome shows
+ * those): the window shows again the tab it showed before. The user switches
+ * to the new tab if they want to watch. Serialized with tab strip changes, so
+ * their guard does not undo it.
+ */
+function keepBehind(tabId) {
+  return serialized(async () => {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab?.active) return;
+    state.openedByAgent.delete(tabId);
+    for (const id of state.shown.get(tab.windowId) ?? []) {
+      if (id === tabId) continue;
+      const before = await chrome.tabs.get(id).catch(() => null);
+      if (before?.windowId !== tab.windowId) continue;
+      await chrome.tabs.update(id, { active: true }).catch(() => {});
+      return;
+    }
+  }).catch(() => {});
+}
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => void noticeShown(tabId, windowId));
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (state.shown.delete(windowId)) chrome.storage.session.set({ shown: [...state.shown] }).catch(() => {});
+});
 
 async function liveGroup() {
   if (state.groupId === null || !chrome.tabGroups) return null;
@@ -493,7 +585,8 @@ async function liveGroup() {
 /**
  * Puts an agent tab (opened or taken by an agent) in the profile's group, at
  * its end, moving it to the group's window if needed; the group stays at the
- * right end of the tab strip.
+ * right end of the tab strip. A tab the user is looking at in another window
+ * stays there, in front.
  */
 function groupAgentTab(tabId) {
   if (!chrome.tabGroups) return Promise.resolve();
@@ -504,6 +597,8 @@ function groupAgentTab(tabId) {
     if (window?.type !== "normal") return; // popups cannot hold groups
     const group = await liveGroup();
     if (group && tab.groupId === group.id) return;
+    // Moving it would leave its window showing another tab.
+    if (group && group.windowId !== tab.windowId && tab.active) return;
     if (tab.pinned) await chrome.tabs.update(tabId, { pinned: false });
     if (group) {
       // Moving keeps the page as it is: no reload.
@@ -516,21 +611,25 @@ function groupAgentTab(tabId) {
       state.groupId = groupId;
       await persist();
     }
-    await groupToTheRight();
+    return [tabId, ...(await groupToTheRight())];
   }).catch(() => {
     // Grouping is cosmetic.
   });
 }
 
-/** Moves the group, whole, to the right end of its window; the user's tabs keep their order. */
+/**
+ * Moves the group, whole, to the right end of its window; the user's tabs
+ * keep their order. Returns the ids of the tabs it moved.
+ */
 async function groupToTheRight() {
   const group = await liveGroup();
-  if (!group) return;
+  if (!group) return [];
   const tabs = await chrome.tabs.query({ windowId: group.windowId });
-  const ours = tabs.filter((t) => t.groupId === group.id).map((t) => t.index);
+  const ours = tabs.filter((t) => t.groupId === group.id);
   const others = tabs.filter((t) => t.groupId !== group.id).map((t) => t.index);
-  if (!ours.length || !others.length || Math.max(...others) < Math.min(...ours)) return;
+  if (!ours.length || !others.length || Math.max(...others) < Math.min(...ours.map((t) => t.index))) return [];
   await chrome.tabGroups.move(group.id, { index: -1 });
+  return ours.map((t) => t.id);
 }
 
 let rightTimer = null;
@@ -1381,6 +1480,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   state.committedAt.delete(tabId);
   state.stepIns.delete(tabId);
   state.agentWindow.delete(tabId);
+  state.openedByAgent.delete(tabId);
   const wasTaken = state.taken.delete(tabId);
   chrome.notifications?.clear(`take-${tabId}`).catch(() => {});
   const handedOff = state.handoffs.delete(tabId) || wasTaken;
@@ -1405,9 +1505,21 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(({ sourceTabId, tabId
     state.created.set(tabId, sessionId);
     void persist();
     refreshBadges();
+    // The agent's click opened it (not the user's, stepping in): it opens behind.
+    if (byAgent(sourceTabId)) {
+      state.openedByAgent.set(tabId, Date.now());
+      setTimeout(() => state.openedByAgent.delete(tabId), 2_000);
+      void keepBehind(tabId);
+    }
     void groupAgentTab(tabId);
   });
 });
+
+/** Whether what just happened in the tab came from the agent's request (running, or ended a moment ago). */
+function byAgent(tabId) {
+  const [, end] = state.agentWindow.get(tabId) ?? [0, 0];
+  return (state.busy.get(tabId) ?? 0) > 0 || Date.now() <= end + 1_000;
+}
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.url) noticeClaim(tabId, info.url);

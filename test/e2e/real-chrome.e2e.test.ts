@@ -162,6 +162,13 @@ describe.skipIf(!process.env.REAL_CHROME)("agents in a real Chromium", () => {
       expect(state.email).toBe("a@b.c");
       expect(state.timers).toBeLessThan(500);
       expect(elapsed).toBeLessThan(2_000);
+      // A screenshot needs no tab in front either.
+      const shot = (await agent.callTool({ name: "browser_screenshot", arguments: {} })) as {
+        content: { type: string; data?: string }[];
+        isError?: boolean;
+      };
+      expect(shot.isError).toBeFalsy();
+      expect(shot.content.find((c) => c.type === "image")?.data?.length ?? 0).toBeGreaterThan(1_000);
     }
   });
 });

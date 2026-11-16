@@ -706,10 +706,10 @@ describe("the AI group at the right, and taking the user's tab", () => {
   let homeIndex = 0;
 
   it("takes the user's tab as it is: no reload, fields and scroll kept, moved into the group", async () => {
-    // The user's tab, in a window of its own, with typed text and a scroll position.
+    // The user's tab, behind another one in a window of its own, with typed text and a scroll position.
     const created = await worker.evaluate(async (url) => {
       const window = await chrome.windows.create({ url, focused: false });
-      await chrome.tabs.create({ windowId: window.id, url: "about:blank", active: false });
+      await chrome.tabs.create({ windowId: window.id, url: "about:blank", active: true });
       return { tabId: window.tabs[0].id, windowId: window.id };
     }, `${base}/article.html?user-tab`);
     takenTab = created.tabId;

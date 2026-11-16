@@ -179,7 +179,7 @@ export const tabList = defineTool({
 export const tabTake = defineTool({
   name: "browser_tab_take",
   description:
-    "Take one of the user's open tabs to work in, exactly as it is — page, sign-in, filled fields and scroll stay; nothing reloads. ONLY when the user asked you to work in that tab (e.g. \"continue in that tab\"); find it with browser_tab_list. It joins the AI group and the user is told, with a Give back button. It stays the user's: it is never closed, and goes back to its place with browser_tab_release (or when you finish).",
+    "Take one of the user's open tabs to work in, exactly as it is — page, sign-in, filled fields and scroll stay; nothing reloads. ONLY when the user asked you to work in that tab (e.g. \"continue in that tab\"); find it with browser_tab_list. It joins the AI group (a tab the user is looking at in another window stays there) and the user is told, with a Give back button; the tab they are looking at does not change. It stays the user's: it is never closed, and goes back to its place with browser_tab_release (or when you finish).",
   inputSchema: z.object({
     tabId: z.number().int().describe("The user's tab, from browser_tab_list"),
     note: z.string().min(1).max(120).describe('What you will do there, short (shown to the user, e.g. "finishing the order")'),
@@ -187,14 +187,15 @@ export const tabTake = defineTool({
   annotations: NAVIGATION,
   handle: async (context, { tabId, note }) => {
     const tab = await context.send("browser_tab_take", { tabId, note });
-    return tabResult(context, `Took tab ${tab.id} (${tab.title || tab.url}) from the user; you work in it now. Give it back with browser_tab_release when you are done`);
+    const where = !tab.grouped && tab.active ? " (the user is looking at it, so it stays in its window)" : "";
+    return tabResult(context, `Took tab ${tab.id} (${tab.title || tab.url}) from the user${where}; you work in it now. Give it back with browser_tab_release when you are done`);
   },
 });
 
 export const tabRelease = defineTool({
   name: "browser_tab_release",
   description:
-    "Give a tab you took from the user (browser_tab_take) back: it leaves the AI group and returns to its window and place, open. Without a tabId, your current tab.",
+    "Give a tab you took from the user (browser_tab_take) back: it leaves the AI group and returns to its window and place, open (if the user is looking at it in another window, it stays there, in front). Without a tabId, your current tab.",
   inputSchema: z.object({
     tabId: z.number().int().optional().describe("Tab id from browser_tab_list (default: your current tab)"),
   }),
@@ -202,7 +203,11 @@ export const tabRelease = defineTool({
   handle: async (context, { tabId }) => {
     const tab = await context.send("browser_tab_release", { tabId });
     const id = tab?.id ?? tabId;
-    return text(`Gave ${id === undefined ? "the tab" : `tab ${id}`} back to the user; it is back where it was.`);
+    const which = id === undefined ? "the tab" : `tab ${id}`;
+    if (tab?.keptInFront) {
+      return text(`Gave ${which} back to the user. They are looking at it, so it stays where it is.`);
+    }
+    return text(`Gave ${which} back to the user; it is back where it was.`);
   },
 });
 

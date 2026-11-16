@@ -12,6 +12,10 @@ they are done.
 It started as a hardened fork of [Browser MCP](https://github.com/BrowserMCP/mcp)
 and stays compatible with its extension. [Türkçe README](README.tr.md)
 
+> **Use at your own risk.** Agents act in your browser, signed in as you, and
+> can do anything you can do there. Read the [disclaimer](#disclaimer) before
+> you use it.
+
 ## What's different from Browser MCP
 
 | | Browser MCP | browsermcp-plus |
@@ -152,6 +156,11 @@ an agent with its own tab, and agents work in parallel:
   own. Agent tabs sit in one tab group, **AI**, per profile however many agents
   work; your own tabs are never in it. A tab's agent shows by its initials on
   the extension icon (the project folder, or `--session-name`).
+- **Agents work behind your back, literally.** Nothing they do changes the tab
+  you are looking at, in any window: opening tabs, taking and giving back yours,
+  moving the AI group, links their pages open in new tabs (those open behind).
+  No tool needs its tab in front — clicks, typing and screenshots work in
+  background tabs — so to watch, switch to the tab yourself.
 - **You see it working.** The page an agent works in gets a thin, soft glow at
   its edges and a small label in the corner — the agent's name and what it is
   doing (reading, typing, clicking). It never takes clicks, moves the layout or
@@ -181,7 +190,9 @@ an agent with its own tab, and agents work in parallel:
   scroll stay), the tab moves into the AI group, and Chrome tells you once,
   with a **Give back** button (also in the popup). It stays yours: never
   closed, and back in its old window and place when the agent is done
-  (`browser_tab_release`). Agents take a tab only when you ask them to.
+  (`browser_tab_release`). Agents take a tab only when you ask them to. A tab
+  you are looking at stays in front: in another window it stays there instead
+  of moving into the group, and one you went to watch stays where you are.
 - The AI group stays at the right end of the tab strip; new agent tabs open at
   its end, and if you open tabs to its right it moves back, calmly.
 - An agent cannot touch another agent's tab, nor your tabs unless you connect
@@ -256,9 +267,35 @@ npm run bench     # tool latency and snapshot size on a large page (ROWS=150 for
 The wire protocol is documented in [`src/protocol.ts`](src/protocol.ts), the
 extension in [`extension/README.md`](extension/README.md).
 
+## Disclaimer
+
+browsermcp-plus is a powerful tool. It gives AI agents control of your real
+browser, signed in to your accounts. In the tabs it can reach, an agent can do
+anything you could do: send messages and email, post in public, change account
+settings, delete data, submit forms, buy things and make payments. AI models
+make mistakes, and web pages can contain text written to mislead them
+(prompt injection).
+
+- **You are responsible for its use.** You choose the agents, the profiles
+  and the sites, and you alone are responsible for every action taken through
+  it, for complying with the terms of the sites you use it on, and for
+  following the laws that apply to you.
+- **Stay in control.** Watch what agents do and confirm anything that matters
+  yourself. Do not use it with accounts or data you cannot afford to have
+  changed, deleted or exposed.
+- **No warranty, no liability.** The software is provided "as is", without
+  warranty of any kind, express or implied. To the fullest extent permitted by
+  law, Novpix LLC and the contributors are not liable for any damage, loss of
+  data, financial loss, account suspension or other consequence arising from
+  its use or from actions agents take with it. See sections 7 and 8 of the
+  [Apache License 2.0](LICENSE).
+- **Independent project.** browsermcp-plus is not affiliated with or endorsed
+  by Google, Anthropic, the Browser MCP authors or any other company whose
+  products it works with. Chrome is a trademark of Google LLC.
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) — based on
+Copyright 2026 Novpix LLC. Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) — based on
 [Browser MCP](https://github.com/BrowserMCP/mcp), which was adapted from
 [Playwright MCP](https://github.com/microsoft/playwright-mcp). Not affiliated
 with the Browser MCP authors.

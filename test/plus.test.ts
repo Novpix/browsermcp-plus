@@ -39,6 +39,8 @@ async function setup({ plus }: { plus: boolean }) {
     browser_tab_new: ({ url }: { url?: string }) => ({ ...tabs[0], id: 3, url: url ?? "about:blank" }),
     browser_tab_select: ({ tabId }: { tabId: number }) => ({ ...tabs[1], id: tabId, connected: true }),
     browser_tab_close: () => tabs[1],
+    browser_tab_take: ({ tabId }: { tabId: number }) => ({ ...tabs[1], id: tabId, active: tabId === 4, connected: true, owner: "taken" }),
+    browser_tab_release: ({ tabId }: { tabId?: number }) => ({ ...tabs[1], id: tabId ?? 2, ...(tabId === 4 ? { keptInFront: true } : {}) }),
   });
   const extension = new FakeExtension(handlers, plus ? [...PLUS_MESSAGES] : undefined);
   await extension.connect(port, plus ? PLUS_ORIGIN : undefined);
@@ -125,6 +127,16 @@ describe("Browser MCP Plus tools", () => {
     expect(selected.text).toContain("Switched to tab 2");
     const closed = await call("browser_tab_close", {});
     expect(closed.text).toContain("now connected to tab 2");
+  });
+
+  it("take and release say when the tab stays where the user is looking at it", async () => {
+    const { call } = await setup({ plus: true });
+    expect((await call("browser_tab_take", { tabId: 2, note: "checking" })).text).toContain("Took tab 2 (Docs) from the user; you work in it now.");
+    expect((await call("browser_tab_take", { tabId: 4, note: "checking" })).text).toContain(
+      "Took tab 4 (Docs) from the user (the user is looking at it, so it stays in its window); you work in it now.",
+    );
+    expect((await call("browser_tab_release", { tabId: 2 })).text).toBe("Gave tab 2 back to the user; it is back where it was.");
+    expect((await call("browser_tab_release", { tabId: 4 })).text).toBe("Gave tab 4 back to the user. They are looking at it, so it stays where it is.");
   });
 });
 

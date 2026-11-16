@@ -70,11 +70,14 @@ export type ExtensionMessages = {
   browser_tab_close: { payload: { tabId?: number }; result: TabInfo | null };
   /** Leaves a tab to the user (it stays open, out of the agents' group) with a note. */
   browser_tab_handoff: { payload: { tabId?: number; note: string }; result: TabInfo };
-  /** The page's readable text (or one element's), frames included. */
   /** Takes a tab of the user's to work in, as it is (no reload); it stays theirs. */
   browser_tab_take: { payload: { tabId: number; note: string }; result: TabInfo };
-  /** Gives a taken tab back to where it was. */
-  browser_tab_release: { payload: { tabId?: number }; result: TabInfo | null };
+  /**
+   * Gives a taken tab back to where it was; `keptInFront` when the user is
+   * looking at it in another window than its own, so it stayed there.
+   */
+  browser_tab_release: { payload: { tabId?: number }; result: (TabInfo & { keptInFront?: boolean }) | null };
+  /** The page's readable text (or one element's), frames included. */
   browser_get_text: {
     payload: { ref?: string; selector?: string; links?: boolean };
     result: { text: string; url: string; title: string };
