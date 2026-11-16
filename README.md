@@ -27,6 +27,9 @@ and stays compatible with its extension. [Türkçe README](README.tr.md)
 | Several agents at once | each new client kills the previous one | every agent in its own tab, in parallel |
 | Tabs the agent opened | stay open | close when the agent is done (unless you keep them) |
 | Chrome profiles | the one you connected | lists them; agents switch profile (`browser_profile_select`) |
+| Frames from other sites (payment forms, embedded sign-ins, chat boxes) | invisible | read, clicked and typed into like the page |
+| Reading a long email or article | links only | `browser_get_text`: the full text as Markdown, in pages |
+| Chrome's "is debugging" bar | on while a tab is connected | only while an agent clicks or types |
 | Builds from its own repository, tests, CI | ✗ | ✓ unit + real-browser end-to-end tests |
 
 ## Install
@@ -83,8 +86,9 @@ agents use a tab you have open, click the extension icon
 | --- | --- |
 | `browser_navigate` | Open a URL (`example.com` → `https://example.com`) |
 | `browser_go_back` / `browser_go_forward` / `browser_reload` | History and reload |
-| `browser_snapshot` | Accessibility snapshot with element refs (optionally one subtree) |
+| `browser_snapshot` | Accessibility snapshot with element refs, frames from other sites and closed shadow DOM included (one subtree with `ref`, the rest of a long one with `offset`) |
 | `browser_find` | Find elements by text without loading the whole snapshot |
+| `browser_get_text` | The page's (or one element's) text as Markdown — headings, lists, tables, links — in full, in pages |
 | `browser_click` / `browser_hover` | Act on an element from the snapshot |
 | `browser_type` | Type into an element (key by key for masked inputs), optionally pressing Enter |
 | `browser_fill_form` | Fill many fields — text, checkboxes, radios, dropdowns, sliders, dates — in one call |
@@ -95,18 +99,25 @@ agents use a tab you have open, click the extension icon
 | `browser_handle_dialog` | Accept or dismiss `alert` / `confirm` / `prompt` dialogs |
 | `browser_evaluate` | Run JavaScript in the page, optionally on a snapshot element |
 | `browser_scroll` | Scroll by pixels or scroll an element into view |
-| `browser_tab_list` / `_new` / `_select` / `_close` | Work across tabs |
+| `browser_tab_list` / `_new` / `_select` / `_close` | Work across tabs and windows (`allProfiles` lists every profile); the list says whose each tab is |
+| `browser_tab_handoff` | Leave a tab to the user with a note (sign-in, captcha, approval, a result) |
+| `browser_get_file` | A PDF, image or any file the browser can reach, with its logins: images inline, every file saved locally |
+| `browser_download` / `browser_downloads` | Download with the browser; list downloads and where they are saved |
 | `browser_profiles` | List the Chrome profiles (folder, name, Google account) and which ones are connected |
 | `browser_profile_select` | Work in another profile; opens a Chrome window for it if needed |
 | `browser_wait` / `browser_wait_for` | Wait for time, or for text to appear/disappear |
-| `browser_get_console_logs` | Read the page console |
-| `browser_screenshot` | PNG of the visible viewport |
+| `browser_get_console_logs` | Console messages, uncaught errors and failed network requests |
+| `browser_screenshot` | PNG of the viewport, one element (`ref`) or the whole page (`fullPage`) |
 
 Actions (click, type, …) answer with a short report — URL, title, whether a new
-page loaded, open dialogs, new tabs — instead of the whole page, which keeps
-agents fast and their context small. Pass `snapshot: true` when you want the
-page right away. Clicks on disabled or covered elements fail with an
-explanation instead of silently hitting the overlay.
+page loaded, open dialogs, downloads, and what changed on the page since the
+agent's last snapshot (`+ added`, `~ changed`, `- removed` lines) — instead of
+the whole page, which keeps agents fast and their context small. When the page
+opens a tab (a link to a new tab, a popup), the agent moves to it, and back
+when it closes. Pass `snapshot: true` when you want the page right away. Clicks
+on disabled or covered elements fail with an explanation instead of silently
+hitting the overlay. Agents never type into password fields: they hand the tab
+to the user.
 
 Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) so clients can
 skip confirmation for read-only ones. With the original Browser MCP extension
@@ -137,15 +148,27 @@ Every Claude Code session (or other MCP client) that starts browsermcp-plus is
 an agent with its own tab, and agents work in parallel:
 
 - An agent takes a free tab you connected, or opens a background tab of its
-  own. Its tabs carry its initials on the extension icon (the project folder,
-  or `--session-name`); there are no tab groups.
+  own. Agent tabs sit in one tab group, **AI**, per profile however many agents
+  work; your own tabs are never in it. A tab's agent shows by its initials on
+  the extension icon (the project folder, or `--session-name`).
+- **You see it working.** The page an agent works in gets a thin, soft glow at
+  its edges and a small label in the corner — the agent's name and what it is
+  doing (reading, typing, clicking). It never takes clicks, moves the layout or
+  shows in screenshots and snapshots, follows `prefers-reduced-motion`, and
+  fades when the agent stops.
 - **Tabs close when the agent is done.** The tabs opened for an agent, and the
   tabs its pages open (links to new tabs, popups), close when its session
   ends. If the server dies without saying so, they close after 10 seconds
   unless a server comes back. Tabs you connected never close; to keep a tab an
   agent opened, click the extension icon in it and press **Keep this tab** (or
   **Keep** in the list): the agent lets go of it and it stays yours.
-- An agent cannot select or close another agent's tab.
+- **When you have to do something** (sign in, a captcha, an approval, a result
+  to look at), the agent hands the tab to you with `browser_tab_handoff`: it
+  leaves the group, never closes, says "Your turn: …" in its corner, and its
+  title and icon blink until you switch to it. The toolbar icon counts tabs
+  waiting for you; a window in the background asks for attention once.
+- An agent cannot touch another agent's tab, nor your tabs unless you connect
+  them; `browser_tab_list` says whose each tab is.
 - The first server is the hub the extensions connect to; the others join it.
   If the hub exits, another server takes its place automatically.
 - The extension popup shows every agent, its tabs, what it is doing and its
@@ -172,6 +195,21 @@ other extensions that connect with the same id (such as a Tabrein build), and
 refuses Tabrein MCP sessions. If another program holds the port, the server
 waits in standby and says which.
 
+## Frames, reading and the debugger
+
+Every frame runs the page agent. A frame from another site (a payment form, an
+embedded sign-in, a captcha, a chat box) shows in the snapshot under its
+`iframe`, and its elements have refs like `f12e3` that click, type and the
+other tools use as usual: Chrome routes the input to the frame. Closed shadow
+roots are read too.
+
+Reading — snapshots, `browser_find`, `browser_get_text`, console and network
+errors, navigation — goes through content scripts and never needs the
+debugger, so Chrome's "is debugging this browser" bar only shows while an
+agent clicks, types or takes a screenshot, and goes away after 20 idle
+seconds. A JavaScript dialog the page opens on its own is reported at once;
+since no debugger saw it open, `browser_handle_dialog` closes it by reloading.
+
 ## Security model
 
 - The server listens on `127.0.0.1` / `::1` only.
@@ -183,6 +221,9 @@ waits in standby and says which.
   tab connected, or press **Stop all**.
 - The extension acts only in the tabs you connect and the tabs it opens for
   agents; Chrome shows its "is debugging this browser" bar while it does.
+- Agents never type into or read password fields (`browser_type` and
+  `browser_fill_form` refuse, the snapshot masks them, `browser_evaluate`
+  refuses a password field as its element); they hand the tab to you.
 - Page content returned by the tools is untrusted input for the model.
 
 ## Development
@@ -192,6 +233,7 @@ npm install
 npm run check     # typecheck + unit tests + build
 npm run test:e2e  # Chromium + extension end to end (single, multi-agent, profiles)
 npm run test:real # background tabs in a real, visible Chromium (needs a display)
+npm run bench     # tool latency and snapshot size on a large page (ROWS=150 for an ordinary one)
 ```
 
 The wire protocol is documented in [`src/protocol.ts`](src/protocol.ts), the

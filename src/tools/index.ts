@@ -1,7 +1,8 @@
-import { evaluate, fillForm, handleDialog, scroll, tabClose, tabList, tabNew, tabSelect, uploadFile } from "./plus";
+import { download, downloads, getFile } from "./files";
+import { evaluate, fillForm, handleDialog, scroll, tabClose, tabHandoff, tabList, tabNew, tabSelect, uploadFile } from "./plus";
 import { click, drag, hover, pressKey, selectOption, type } from "./interaction";
 import { goBack, goForward, navigate, reload } from "./navigation";
-import { find, getConsoleLogs, screenshot, snapshot, wait, waitFor } from "./page";
+import { find, getConsoleLogs, getText, screenshot, snapshot, wait, waitFor } from "./page";
 import { profileSelect, profiles } from "./profiles";
 import type { Tool } from "./tool";
 
@@ -12,6 +13,7 @@ export const tools: Tool[] = [
   reload,
   snapshot,
   find,
+  getText,
   click,
   hover,
   type,
@@ -32,6 +34,10 @@ export const tools: Tool[] = [
   tabNew,
   tabSelect,
   tabClose,
+  tabHandoff,
+  getFile,
+  downloads,
+  download,
   // Chrome profiles: work with another Google account.
   profiles,
   profileSelect,

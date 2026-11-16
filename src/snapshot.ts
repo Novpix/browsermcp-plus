@@ -5,39 +5,55 @@ import { isActionReport, type ActionReport } from "./protocol";
 
 export type PageSnapshot = { url: string; title: string; snapshot: string };
 
-export async function readPageSnapshot(context: Context): Promise<PageSnapshot> {
+export async function readPageSnapshot(context: Context, expect?: string): Promise<PageSnapshot> {
   // Sequential on purpose: the extension serves requests for one tab and the
   // snapshot should reflect the URL and title read just before it.
   const url = await context.send("getUrl", undefined);
   const title = await context.send("getTitle", undefined);
-  const snapshot = await context.send("browser_snapshot", {});
+  const snapshot = await context.send("browser_snapshot", expect ? { expect } : {});
   return { url, title, snapshot };
 }
 
-function truncate(body: string, maxChars: number): string {
-  if (maxChars <= 0 || body.length <= maxChars) return body;
+/**
+ * A page of a long snapshot: from `offset` (moved to the start of a line) to
+ * at most `maxChars` later, cut at a line boundary, with a note on how to
+ * continue.
+ */
+export function pageOf(
+  body: string,
+  maxChars: number,
+  offset = 0,
+  more: (next: number, left: number) => string = (next, left) =>
+    `# … ${left} more characters. Call browser_snapshot with offset: ${next} to continue, or use browser_find / browser_get_text.`,
+): string {
+  let start = Math.max(0, Math.min(offset, body.length));
+  if (start > 0 && body[start - 1] !== "\n") {
+    const next = body.indexOf("\n", start);
+    start = next < 0 ? body.length : next + 1;
+  }
+  if (start >= body.length && body.length) return "# (end of the content)";
+  const rest = body.slice(start);
+  if (maxChars <= 0 || rest.length <= maxChars) return rest;
   // Cut at a line boundary so no half element line is shown.
-  const cut = body.lastIndexOf("\n", maxChars);
-  return (
-    body.slice(0, cut > 0 ? cut : maxChars) +
-    `\n# … truncated (${body.length} characters). Use browser_find to locate elements, or browser_snapshot with a ref to see one part of the page.`
-  );
+  const cut = rest.lastIndexOf("\n", maxChars);
+  const end = cut > 0 ? cut : maxChars;
+  return `${rest.slice(0, end)}\n${more(start + end + 1, rest.length - end - 1)}`;
 }
 
-function yamlBlock(body: string, maxChars: number): string[] {
-  return ["- Page Snapshot", "```yaml", truncate(body, maxChars), "```"];
+function yamlBlock(body: string, maxChars: number, offset = 0): string[] {
+  return ["- Page Snapshot", "```yaml", pageOf(body, maxChars, offset), "```"];
 }
 
 export function formatSnapshot(
   page: PageSnapshot,
-  options: { status?: string; maxChars?: number } = {},
+  options: { status?: string; maxChars?: number; offset?: number } = {},
 ): string {
-  const { status, maxChars = 0 } = options;
+  const { status, maxChars = 0, offset = 0 } = options;
   return [
     ...(status ? [status, ""] : []),
     `- Page URL: ${page.url}`,
     `- Page Title: ${page.title}`,
-    ...yamlBlock(page.snapshot, maxChars),
+    ...yamlBlock(page.snapshot, maxChars, offset),
   ].join("\n");
 }
 
@@ -76,10 +92,20 @@ export async function actionResult(
   const lines = [status, ""];
   lines.push(`- Page URL: ${report.url}`, `- Page Title: ${report.title}`);
   if (report.navigated) lines.push("- The action loaded a new page.");
-  for (const tab of report.newTabs ?? []) {
+  if (report.switchedTo) {
+    const tab = report.switchedTo;
     lines.push(
-      `- New tab opened: [${tab.id}] ${tab.title || tab.url} — ${tab.url}. Use browser_tab_select to work in it.`,
+      `- The page opened a new tab and you now work in it: [${tab.id}] ${tab.title || tab.url} — ${tab.url}. Your previous tab stays open (browser_tab_select switches back).`,
     );
+  } else {
+    for (const tab of report.newTabs ?? []) {
+      lines.push(
+        `- New tab opened: [${tab.id}] ${tab.title || tab.url} — ${tab.url}. Use browser_tab_select to work in it.`,
+      );
+    }
+  }
+  for (const download of report.downloads ?? []) {
+    lines.push(`- A download started: ${download.filename || download.url}. browser_downloads shows where it is saved.`);
   }
   if (report.dialog) {
     const { type, message } = report.dialog;
@@ -89,8 +115,16 @@ export async function actionResult(
   } else if (wantSnapshot) {
     const snapshot = await context.send("browser_snapshot", {});
     lines.push(...yamlBlock(snapshot, context.snapshotMaxChars));
-  } else if (report.navigated) {
+  } else if (report.navigated || report.switchedTo) {
     lines.push("- Use browser_snapshot or browser_find to see the new page.");
+  } else if (report.changes) {
+    if (!report.changes.length) {
+      lines.push("- Nothing changed on the page.");
+    } else {
+      lines.push("- Changes on the page since your last snapshot (+ added, ~ changed, - removed):");
+      lines.push(...report.changes.map((change) => `  ${change}`));
+      if (report.moreChanges) lines.push(`  … and ${report.moreChanges} more; browser_snapshot shows the whole page.`);
+    }
   }
   return { content: [{ type: "text", text: lines.join("\n") }] };
 }

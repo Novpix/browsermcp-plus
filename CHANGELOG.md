@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.7.0
+
+Agents see every frame, read whole pages, and show — quietly — where they work.
+
+### Added
+
+- **Frames from other sites.** Every frame runs the page agent; frames from
+  another origin (payment forms, embedded sign-ins, captchas, chat boxes)
+  appear in the snapshot under their `iframe`, nested ones too, with refs like
+  `f12e3` that click, type, select and the rest use as usual. Closed shadow
+  roots are read as well.
+- `browser_get_text`: the page's (or one element's) text as Markdown —
+  headings, paragraphs, lists, tables, code, links — in full and in pages.
+- Action reports say what changed on the page since the agent's last snapshot
+  (`+` added, `~` changed, `-` removed), so a click rarely needs a new snapshot.
+- `browser_snapshot` continues a long snapshot with `offset`.
+- When a page opens a tab or popup, the agent moves to it (and back when it closes).
+- `browser_screenshot` of one element (`ref`) or the whole page (`fullPage`).
+- `browser_get_file` (PDFs, images, any file, with the browser's logins: images
+  inline, everything saved locally), `browser_download` and `browser_downloads`.
+- `browser_get_console_logs` also lists uncaught exceptions and failed network
+  requests (HTTP 4xx/5xx, network errors).
+- One **AI** tab group per profile for every agent's tabs; tabs the user keeps
+  or is handed leave it.
+- A quiet overlay on the page an agent works in: a soft edge glow and a corner
+  label with the agent's name and what it is doing (in Turkish in a Turkish
+  browser). No layout change, no clicks taken, not in screenshots or snapshots,
+  `prefers-reduced-motion` respected.
+- `browser_tab_handoff`: leave a tab to the user with a note. The tab stays
+  open, says "Your turn: …", blinks its title and icon until the user switches
+  to it, and the toolbar icon counts tabs waiting; a background window asks
+  for attention once. The popup lists them under "Waiting for you".
+- `browser_tab_list` lists windows and, with `allProfiles`, every profile; each
+  tab says whose it is (yours, another agent's, the user's, handed over).
+
+### Changed
+
+- **The debugger only attaches to act.** Reading and navigating go through
+  content scripts and webNavigation; Chrome's "is debugging" bar shows while an
+  agent clicks, types or takes a screenshot and leaves after 20 idle seconds.
+- Agents may only use their own tabs and tabs the user connected; they close
+  only their own tabs. They never type into password fields (they hand the tab
+  over instead), and `browser_evaluate` refuses a password field as its element.
+- Same-site links are shown as paths in the snapshot (shorter).
+- A dialog a page opens by itself is reported at once instead of timing out;
+  `browser_handle_dialog` closes it by reloading.
+- Searching a page that has just loaded waits briefly while it is still
+  fetching or building (e.g. an editor from a CDN).
+- Agent tabs are remembered across extension reloads, so they still close
+  with their agent.
+- New permissions: `downloads`, `tabGroups`, `webRequest`. Chrome 120 or later.
+
+
 ## 0.6.0
 
 Agents clean up after themselves, and can work in any Chrome profile.

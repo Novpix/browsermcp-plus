@@ -11,6 +11,9 @@ tool works, and adds what that closed extension cannot do:
 | `browser_scroll` | Mouse-wheel scrolling by pixels, or scroll an element into view |
 | `browser_tab_list` / `browser_tab_new` / `browser_tab_select` / `browser_tab_close` | Work across tabs |
 | `browser_profiles` / `browser_profile_select` | List the Chrome profiles and work in another one |
+| `browser_get_text` | The page's readable text, frames included |
+| `browser_tab_handoff` | Leave a tab to the user with a note |
+| `browser_get_file` / `browser_download` / `browser_downloads` | Files and downloads with the browser's logins |
 
 ## Install (unpacked)
 
@@ -40,6 +43,33 @@ Tabs opened for a session, and the tabs its pages open (found through
 `openerTabId` names the window's active tab instead), close when the server
 reports that the session ended, or 10 s after the server connection drops if
 no server comes back. **Keep this tab** in the popup takes a tab out of that.
+
+## Frames
+
+`content/agent.js` runs in every frame. A frame's snapshot includes the
+same-origin frames inside it; a frame from another site leaves a placeholder
+(`- <<frame:TOKEN>>`) that the background fills with that frame's own snapshot.
+Which `<iframe>` holds which frame is learnt with a postMessage handshake
+(the parent says hello, the child answers with its token). Refs of subframes
+are `f<frameId>e<n>`; their click points are translated through each
+`<iframe>`'s offset to the tab's viewport, where Chrome routes input to the
+frame.
+
+## The debugger
+
+Reading (snapshots, text, console via a page hook, failed requests via
+`webRequest`, navigation via `webNavigation`) never attaches the debugger. It
+attaches for input, screenshots and evaluate, and detaches after 20 idle
+seconds. Page dialogs are announced by the page hook before they block the
+page, since a dialog opened while detached is invisible to CDP.
+
+## The AI group, the overlay and handing a tab over
+
+Agent tabs share one tab group (`AI`, blue) per profile; new agent tabs open
+in its window. The overlay is a fixed, `pointer-events: none` element with a
+closed shadow root, hidden during screenshots and skipped by the snapshot. A
+handed-over tab leaves the group, shows a note, and alternates its title and
+icon until the user activates it (the background tells the page to stop).
 
 ## Profiles
 

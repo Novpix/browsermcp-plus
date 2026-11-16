@@ -15,6 +15,11 @@
 // Every Chrome profile runs its own copy of this extension. The server tells
 // them apart by a random install id and the profile's Google account, or by a
 // one-time page it opens in a profile (see noticeClaim).
+//
+// The tabs agents open sit in one tab group per profile ("AI"), whatever the
+// number of agents. The debugger (and Chrome's "is debugging" bar) is only
+// attached while an agent clicks, types or takes screenshots; reading pages
+// goes through content scripts.
 
 import { keyEvents } from "./keys.js";
 
@@ -28,7 +33,6 @@ const KEEPALIVE_MS = 20_000;
  * server comes back and reports its sessions.
  */
 const ORPHAN_GRACE_MS = 10_000;
-const MAX_CONSOLE_ENTRIES = 1_000;
 /** Below the server's 30 s request timeout, so a stuck request never blocks the queue. */
 const REQUEST_TIMEOUT_MS = 25_000;
 /** Cap on waiting for a page to load; slow trackers must not fail navigation. */
@@ -40,6 +44,23 @@ const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
 const DEFAULT_SESSION = "default";
 /** Colours that tell agents apart in the popup. */
 const AGENT_COLORS = ["blue", "purple", "cyan", "orange", "pink", "green", "red", "yellow"];
+/** The one tab group agent tabs share in a profile. */
+const GROUP_TITLE = "AI";
+const GROUP_COLOR = "blue";
+/** The debugger is detached from a tab this long after its last use, so Chrome's bar goes away. */
+const DEBUGGER_IDLE_MS = 20_000;
+/** Reads right after a page loaded wait (at most this long) for its content to settle. */
+const FRESH_PAGE_MS = 8_000;
+/** Largest file browser_get_file returns. */
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+/** What the overlay says an agent is doing, by message. */
+const ACTIVITY = {
+  browser_snapshot: "reading", browser_get_text: "reading", browser_get_console_logs: "reading", browser_get_file: "reading",
+  browser_navigate: "opening", browser_go_back: "opening", browser_go_forward: "opening",
+  browser_click: "clicking", browser_hover: "clicking", browser_drag: "clicking", browser_select_option: "clicking",
+  browser_handle_dialog: "clicking", browser_type: "typing", browser_fill_form: "typing", browser_press_key: "typing",
+  browser_scroll: "scrolling", browser_screenshot: "looking", browser_upload_file: "uploading", browser_evaluate: "running",
+};
 /** The page a server opens a Chrome profile with; the token tells the server which profile this is. */
 const CLAIM_URL = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)\/browsermcp-plus\/profile\/([\w-]{16,})(?:[?#].*)?$/;
 
@@ -56,6 +77,13 @@ const CAPABILITIES = [
   "browser_fill_form",
   "sessions_update",
   "profile_set",
+  "browser_get_text",
+  "browser_get_file",
+  "browser_downloads",
+  "browser_download",
+  "browser_tab_handoff",
+  "frames",
+  "element_screenshot",
 ];
 
 const state = {
@@ -86,6 +114,32 @@ const state = {
   claims: new Map(),
   /** Tabs showing a badge. */
   badged: new Set(),
+  /** tabId -> { note, agent, sessionId, at, seen }: tabs an agent left to the user. */
+  handoffs: new Map(),
+  /** The "AI" tab group of this profile. */
+  groupId: null,
+  /** tabId -> last time the debugger was used in it. */
+  cdpUsedAt: new Map(),
+  /** tabId -> requests running in it (its debugger stays attached meanwhile). */
+  busy: new Map(),
+  /** tabId -> when its page last committed a navigation. */
+  committedAt: new Map(),
+  /** tabId -> { text, ms }: the last snapshot, to report what an action changed. */
+  lastSnap: new Map(),
+  /** tabId -> Map(frameId -> { token, inlined, parent, url }) from the last multi-frame read. */
+  frameInfo: new Map(),
+  /** tabId -> failed network requests since the page loaded. */
+  network: new Map(),
+  /** tabId -> when the agent's last action in it ended. */
+  actedAt: new Map(),
+  /** Tabs whose current page got the agent's input (it may now ask before unloading). */
+  activated: new Set(),
+  /** tabId -> when the console hook went into its page. */
+  hookedAt: new Map(),
+  /** tabId -> console messages from before the hook, replayed by the debugger. */
+  earlyConsole: new Map(),
+  /** Downloads started while an action ran, by the tab of that action. */
+  downloadWatch: new Map(),
   attached: new Set(),
   /** tabId -> Map(contextId -> context) from Runtime.executionContextCreated. */
   contexts: new Map(),
@@ -93,8 +147,6 @@ const state = {
   mainFrames: new Map(),
   /** tabId -> open JavaScript dialog (alert/confirm/prompt/beforeunload). */
   dialogs: new Map(),
-  /** tabId -> console entries since the last page load. */
-  consoleLogs: new Map(),
   /** tabId -> tail of that tab's request queue. */
   queues: new Map(),
   /** tabId -> tab ids opened by the page during the running action. */
@@ -105,13 +157,20 @@ const state = {
 // Persistence and lifecycle
 
 async function persist() {
-  await chrome.storage.session.set({
-    pool: [...state.pool],
-    created: [...state.created],
-    sessions: [...state.sessions.values()],
-    lostAt: state.lostAt,
-    paused: state.paused,
-  });
+  const tabs = { created: [...state.created], handoffs: [...state.handoffs], groupId: state.groupId };
+  await Promise.all([
+    chrome.storage.session.set({
+      pool: [...state.pool],
+      sessions: [...state.sessions.values()],
+      lostAt: state.lostAt,
+      paused: state.paused,
+      ...tabs,
+    }),
+    // Survives reloading the extension (session storage does not), so agent
+    // tabs are still closed when their agent ends. Tab ids are not reused
+    // after a browser restart, so stale entries never match a user's tab.
+    chrome.storage.local.set({ agentTabs: tabs }),
+  ]);
 }
 
 let restoring = null;
@@ -123,9 +182,11 @@ function restore() {
 
 async function load() {
   const [saved, local] = await Promise.all([
-    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused"]),
-    chrome.storage.local.get(["port", "autoConnect", "installId", "profile"]),
+    chrome.storage.session.get(["pool", "created", "sessions", "lostAt", "paused", "handoffs", "groupId"]),
+    chrome.storage.local.get(["port", "autoConnect", "installId", "profile", "agentTabs"]),
   ]);
+  // The extension was reloaded: session storage is empty, the local copy is not.
+  const tabsSaved = saved.created ? saved : (local.agentTabs ?? {});
   if (Number.isInteger(local.port)) state.port = local.port;
   if (typeof local.autoConnect === "boolean") state.autoConnect = local.autoConnect;
   state.installId = typeof local.installId === "string" ? local.installId : crypto.randomUUID();
@@ -137,7 +198,11 @@ async function load() {
   const tabs = await chrome.tabs.query({});
   const alive = new Set(tabs.map((t) => t.id));
   for (const tabId of saved.pool ?? []) if (alive.has(tabId)) state.pool.add(tabId);
-  for (const [tabId, sessionId] of saved.created ?? []) if (alive.has(tabId)) state.created.set(tabId, sessionId);
+  for (const [tabId, sessionId] of tabsSaved.created ?? []) if (alive.has(tabId)) state.created.set(tabId, sessionId);
+  for (const [tabId, handoff] of tabsSaved.handoffs ?? []) if (alive.has(tabId)) state.handoffs.set(tabId, handoff);
+  if (Number.isInteger(tabsSaved.groupId)) {
+    state.groupId = (await chrome.tabGroups?.get(tabsSaved.groupId).catch(() => null)) ? tabsSaved.groupId : null;
+  }
   for (const session of saved.sessions ?? []) {
     session.busy = 0;
     if (session.tabId !== null && !alive.has(session.tabId)) session.tabId = null;
@@ -178,9 +243,12 @@ async function tabExists(tabId) {
 /** The user allows agents to use this tab (popup "Connect"). */
 async function connectTab(tabId) {
   await restore();
-  await attachDebugger(tabId);
-  if (!state.attached.has(tabId)) await enableDomains(tabId);
+  const tab = await chrome.tabs.get(tabId);
+  if (!/^(https?|file):/.test(tab.url || tab.pendingUrl || "")) {
+    throw new Error("This page can't be automated (browser pages and the Web Store are off limits). Open a website first.");
+  }
   state.pool.add(tabId);
+  state.handoffs.delete(tabId);
   // A tab the user connected is theirs: it never closes with an agent.
   state.created.delete(tabId);
   state.paused = false;
@@ -205,11 +273,102 @@ async function disconnectTab(tabId) {
 /** The user takes over a tab opened for an agent: it stays open and the agent lets go of it. */
 async function keepTab(tabId) {
   await restore();
+  if (state.handoffs.has(tabId)) await handoffSeen(tabId, true);
   state.created.delete(tabId);
   const sessionId = state.owner.get(tabId);
   if (sessionId) unassign(state.sessions.get(sessionId));
+  await ungroupTab(tabId);
   await persist();
   refreshBadges();
+}
+
+/**
+ * The agent leaves a tab to the user (a sign-in, a captcha, a result to look
+ * at): it leaves the group, never closes with the agent, and the page and the
+ * toolbar icon show that something waits for the user.
+ */
+async function handoffTab(session, tabId, note) {
+  const mine = state.created.get(tabId) === session.id || state.owner.get(tabId) === session.id;
+  if (!mine) {
+    throw new Error(`Tab ${tabId} is not one of your tabs. Hand over a tab you opened or work in (browser_tab_list shows them).`);
+  }
+  state.created.delete(tabId);
+  if (state.owner.get(tabId) === session.id) unassign(session);
+  await ungroupTab(tabId);
+  const tab = await chrome.tabs.get(tabId);
+  const window = await chrome.windows.get(tab.windowId).catch(() => null);
+  // The user is looking at it already: no need to call for attention.
+  const looking = tab.active && !!window?.focused;
+  state.handoffs.set(tabId, { note, agent: session.name, sessionId: session.id, at: Date.now(), seen: looking });
+  await runAgent(tabId, 0, "handoffNotice", [session.name, note, !looking]).catch(() => {});
+  // A window in the background asks for attention once (macOS: one Dock bounce).
+  if (window && !window.focused) await chrome.windows.update(window.id, { drawAttention: true }).catch(() => {});
+  await persist();
+  refreshBadges();
+  return tabInfo(await chrome.tabs.get(tabId), session);
+}
+
+/** The user saw (or acted on) a handed-over tab: its title stops alternating; dismissed, the note goes too. */
+async function handoffSeen(tabId, dismissed) {
+  await restore();
+  const handoff = state.handoffs.get(tabId);
+  if (!handoff) return;
+  if (dismissed) state.handoffs.delete(tabId);
+  else handoff.seen = true;
+  runAgent(tabId, 0, dismissed ? "handoffClear" : "handoffQuiet", []).catch(() => {});
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && ![...state.handoffs.values()].some((h) => !h.seen)) {
+    await chrome.windows.update(tab.windowId, { drawAttention: false }).catch(() => {});
+  }
+  await persist();
+  refreshBadges();
+}
+
+// ---------------------------------------------------------------------------
+// The "AI" tab group: one per profile, however many agents work in it.
+
+let groupLock = Promise.resolve();
+
+function withGroupLock(fn) {
+  const run = groupLock.then(fn, fn);
+  groupLock = run.catch(() => {});
+  return run;
+}
+
+async function liveGroup() {
+  if (state.groupId === null || !chrome.tabGroups) return null;
+  const group = await chrome.tabGroups.get(state.groupId).catch(() => null);
+  if (!group) state.groupId = null;
+  return group;
+}
+
+/** Puts an agent tab in the profile's group, moving it to the group's window if needed. */
+function groupAgentTab(tabId) {
+  if (!chrome.tabGroups) return Promise.resolve();
+  return withGroupLock(async () => {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || !state.created.has(tabId)) return;
+    const window = await chrome.windows.get(tab.windowId).catch(() => null);
+    if (window?.type !== "normal") return; // popups cannot hold groups
+    const group = await liveGroup();
+    if (group && tab.groupId === group.id) return;
+    if (group) {
+      if (group.windowId !== tab.windowId) await chrome.tabs.move(tabId, { windowId: group.windowId, index: -1 });
+      await chrome.tabs.group({ groupId: group.id, tabIds: [tabId] });
+      return;
+    }
+    const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
+    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
+    state.groupId = groupId;
+    await persist();
+  }).catch(() => {
+    // Grouping is cosmetic.
+  });
+}
+
+async function ungroupTab(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && tab.groupId !== -1 && tab.groupId === state.groupId) await chrome.tabs.ungroup(tabId).catch(() => {});
 }
 
 /**
@@ -256,17 +415,27 @@ function shortLabel(name) {
   return (name || "AI").replace(/[^\p{L}\p{N}]/gu, "").slice(0, 3).toUpperCase() || "AI";
 }
 
-/** Badges: the agent's initials on its tabs, ON on free connected tabs. */
+/**
+ * Badges: the agent's initials on its tabs, ON on free connected tabs, "!"
+ * on tabs handed to the user; on every other tab, how many handed-over tabs
+ * the user has not looked at yet.
+ */
 function refreshBadges() {
-  const tabs = new Set([...state.pool, ...state.created.keys(), ...state.owner.keys()]);
+  const tabs = new Set([...state.pool, ...state.created.keys(), ...state.owner.keys(), ...state.handoffs.keys()]);
   for (const tabId of state.badged) if (!tabs.has(tabId)) clearBadge(tabId);
   state.badged = tabs;
   for (const tabId of tabs) {
     const session = state.sessions.get(state.owner.get(tabId) ?? state.created.get(tabId));
-    const text = session ? shortLabel(session.name) : state.pool.has(tabId) ? "ON" : "AI";
+    const handoff = !session && state.handoffs.has(tabId);
+    const text = session ? shortLabel(session.name) : handoff ? "!" : state.pool.has(tabId) ? "ON" : "AI";
+    const color = handoff ? "#ff9f0a" : state.pool.has(tabId) && !session ? "#1a7f37" : "#0969da";
     chrome.action.setBadgeText({ tabId, text }).catch(() => {});
-    chrome.action.setBadgeBackgroundColor({ tabId, color: state.pool.has(tabId) && !session ? "#1a7f37" : "#0969da" }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
   }
+  const waiting = [...state.handoffs.values()].filter((h) => !h.seen).length;
+  chrome.action.setBadgeText({ text: waiting ? String(waiting) : "" }).catch(() => {});
+  if (waiting) chrome.action.setBadgeBackgroundColor({ color: "#ff9f0a" }).catch(() => {});
+  syncNetworkListeners();
 }
 
 function clearBadge(tabId) {
@@ -322,11 +491,16 @@ function unassign(session) {
 /** Gives a session the tab, debugger attached. Fails for tabs that cannot be debugged. */
 async function assign(session, tabId) {
   ensureOwnable(session, tabId);
-  await attachDebugger(tabId);
-  if (!state.attached.has(tabId)) await enableDomains(tabId);
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab.url || tab.pendingUrl || "";
+  if (url && !/^(https?|file|about|data|blob):/.test(url)) {
+    throw new Error(`Tab ${tabId} shows ${url}, which extensions may not control. Navigate it to a website first.`);
+  }
   if (session.tabId !== null && session.tabId !== tabId) unassign(session);
   session.tabId = tabId;
   state.owner.set(tabId, session.id);
+  state.handoffs.delete(tabId);
+  void installConsoleHook(tabId);
   await persist();
   refreshBadges();
 }
@@ -398,10 +572,14 @@ async function openTabFor(session, url) {
   }
   state.created.set(tab.id, session.id);
   await persist();
+  await groupAgentTab(tab.id);
   return tab.id;
 }
 
+/** Where a new agent tab goes: the "AI" group's window, else next to the agent's tabs, else the last used window. */
 async function windowFor(session) {
+  const group = await liveGroup();
+  if (group) return group.windowId;
   for (const tabId of [session.tabId, ...createdBy(session), ...state.pool]) {
     if (tabId === null) continue;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -476,6 +654,7 @@ async function setProfile({ profile, adopt }) {
     await chrome.tabs.update(adopt.tabId, { url: "about:blank" }).catch(() => {});
     await waitForDocument(adopt.tabId);
     await assign(session, adopt.tabId).catch(() => {});
+    await groupAgentTab(adopt.tabId);
   }
   await persist();
   refreshBadges();
@@ -621,7 +800,15 @@ async function execute({ type, payload = {} }, session) {
   const handler = handlers[type];
   if (TABLESS.has(type)) return handler(payload, { session, tabId: null });
   const tabId = await tabFor(session);
-  const run = () => handler(payload, { session, tabId });
+  if (ACTIVITY[type]) showActivity(tabId, session, ACTIVITY[type]);
+  const run = async () => {
+    state.busy.set(tabId, (state.busy.get(tabId) ?? 0) + 1);
+    try {
+      return await handler(payload, { session, tabId });
+    } finally {
+      state.busy.set(tabId, state.busy.get(tabId) - 1);
+    }
+  };
   if (UNQUEUED.has(type)) return run();
   // One request at a time per tab, so input events never interleave; other
   // agents' tabs proceed in parallel.
@@ -631,6 +818,12 @@ async function execute({ type, payload = {} }, session) {
     result.catch(() => {}),
   );
   return result;
+}
+
+/** The page shows (subtly) that this agent is at work, and doing what. Never waited for. */
+function showActivity(tabId, session, kind) {
+  if (state.handoffs.has(tabId)) return;
+  runAgent(tabId, 0, "activity", [session.name, kind]).catch(() => {});
 }
 
 function withTimeout(promise, ms, label) {
@@ -657,14 +850,41 @@ function errorMessage(error) {
 // Debugger (CDP) plumbing
 
 function cdp(tabId, method, params = {}) {
+  state.cdpUsedAt.set(tabId, Date.now());
   return chrome.debugger.sendCommand({ tabId }, method, params);
 }
 
-async function ensureAttached(tabId) {
-  if (state.attached.has(tabId)) return;
-  await attachDebugger(tabId);
-  await enableDomains(tabId);
+const attaching = new Map();
+
+/** Attaches the debugger for input, screenshots and evaluate; reading never needs it. */
+function ensureAttached(tabId) {
+  // A dialog opened while detached blocks the page: attaching would hang.
+  if (state.dialogs.get(tabId)?.unanswerable) return Promise.reject(dialogError(tabId));
+  if (state.attached.has(tabId)) {
+    state.cdpUsedAt.set(tabId, Date.now());
+    return Promise.resolve();
+  }
+  let pending = attaching.get(tabId);
+  if (!pending) {
+    pending = (async () => {
+      await attachDebugger(tabId);
+      if (!state.attached.has(tabId)) await enableDomains(tabId);
+    })().finally(() => attaching.delete(tabId));
+    attaching.set(tabId, pending);
+  }
+  return pending;
 }
+
+// Detaches idle tabs, so Chrome's "is debugging this browser" bar only shows
+// while agents act. A tab with an open dialog or a running request stays.
+function sweepDebugger(idleMs = DEBUGGER_IDLE_MS) {
+  const now = Date.now();
+  for (const tabId of [...state.attached]) {
+    if (state.dialogs.has(tabId) || (state.busy.get(tabId) ?? 0) > 0) continue;
+    if (now - (state.cdpUsedAt.get(tabId) ?? 0) >= idleMs) void detach(tabId);
+  }
+}
+setInterval(sweepDebugger, 5_000);
 
 // Fails for tabs Chrome won't let us debug (chrome://, Web Store) or that DevTools holds.
 async function attachDebugger(tabId) {
@@ -691,10 +911,13 @@ async function attachDebugger(tabId) {
 async function enableDomains(tabId) {
   state.attached.add(tabId);
   state.contexts.set(tabId, new Map());
-  state.consoleLogs.set(tabId, []);
+  // Page events first: JavaScript dialogs, navigation start/finish, main frame id.
+  // A page that does not answer (blocked by a dialog) fails here, it does not hang.
+  await withTimeout(cdp(tabId, "Page.enable"), 5_000, "Page.enable").catch((error) => {
+    void detach(tabId);
+    throw new Error(`The page does not respond (${errorMessage(error)}). It may be busy or blocked; try browser_reload.`);
+  });
   await cdp(tabId, "Runtime.enable");
-  // Page events: JavaScript dialogs, navigation start/finish, main frame id.
-  await cdp(tabId, "Page.enable");
   // Agents often work in background tabs, which Chrome hides: it stops
   // rendering them, throttles their timers ~100x and leaves input events
   // unprocessed. Focus emulation (DevTools' "Emulate a focused page") keeps
@@ -705,11 +928,12 @@ async function enableDomains(tabId) {
 }
 
 async function detach(tabId) {
-  state.attached.delete(tabId);
+  const wasAttached = state.attached.delete(tabId);
   state.contexts.delete(tabId);
   state.mainFrames.delete(tabId);
   state.dialogs.delete(tabId);
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  state.cdpUsedAt.delete(tabId);
+  if (wasAttached || attaching.has(tabId)) await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
 const eventWaiters = new Set();
@@ -753,39 +977,174 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     for (const waiter of dialogWaiters) if (waiter.tabId === tabId) waiter.notify();
   } else if (method === "Page.javascriptDialogClosed") {
     state.dialogs.delete(tabId);
-  } else if (method === "Runtime.consoleAPICalled") {
-    pushLog(tabId, {
-      type: params.type,
-      timestamp: params.timestamp,
-      message: params.args.map(formatRemoteObject).join(" "),
-    });
-  } else if (method === "Runtime.exceptionThrown") {
-    const details = params.exceptionDetails;
-    pushLog(tabId, {
-      type: "error",
-      timestamp: params.timestamp,
-      message: details.exception?.description ?? details.text,
-    });
+  } else if (method === "Runtime.consoleAPICalled" || method === "Runtime.exceptionThrown") {
+    // Chrome replays a page's earlier console messages when the debugger
+    // attaches: they fill in what happened before the console hook came.
+    const hookedAt = state.hookedAt.get(tabId) ?? Infinity;
+    if (params.timestamp >= hookedAt) return;
+    const list = state.earlyConsole.get(tabId) ?? [];
+    if (list.length >= 500) return;
+    list.push(
+      method === "Runtime.consoleAPICalled"
+        ? { type: params.type === "warning" ? "warn" : params.type, timestamp: params.timestamp, message: params.args.map(remoteText).join(" ") }
+        : { type: "error", timestamp: params.timestamp, message: params.exceptionDetails.exception?.description ?? params.exceptionDetails.text },
+    );
+    state.earlyConsole.set(tabId, list);
   }
 });
 
-function pushLog(tabId, entry) {
-  const logs = state.consoleLogs.get(tabId);
-  if (!logs) return;
-  logs.push(entry);
-  if (logs.length > MAX_CONSOLE_ENTRIES) logs.shift();
-}
-
-function formatRemoteObject(object) {
-  if ("value" in object) {
-    return typeof object.value === "string" ? object.value : JSON.stringify(object.value);
-  }
+function remoteText(object) {
+  if ("value" in object) return typeof object.value === "string" ? object.value : JSON.stringify(object.value);
   if (object.unserializableValue) return object.unserializableValue;
   if (object.preview?.properties) {
     const props = object.preview.properties.map((p) => `${p.name}: ${p.value}`).join(", ");
     return object.subtype === "array" ? `[${props}]` : `{${props}}`;
   }
   return object.description ?? object.type;
+}
+
+// ---------------------------------------------------------------------------
+// Console messages and failed requests, read without the debugger
+
+/** Runs in the page's own world from the start of each load of an agent tab. */
+function consoleHookSource() {
+  const KEY = Symbol.for("browsermcp-plus.console");
+  if (window[KEY]) return;
+  const entries = [];
+  const format = (value) => {
+    if (typeof value === "string") return value;
+    if (value instanceof Error) return value.stack || String(value);
+    try {
+      return JSON.stringify(value) ?? String(value);
+    } catch {
+      return String(value);
+    }
+  };
+  const push = (type, args) => {
+    entries.push({ type, timestamp: Date.now(), message: args.map(format).join(" ").slice(0, 4000) });
+    if (entries.length > 1000) entries.shift();
+  };
+  for (const type of ["log", "info", "warn", "error", "debug"]) {
+    const original = console[type];
+    console[type] = function (...args) {
+      push(type, args);
+      return original.apply(this, args);
+    };
+  }
+  addEventListener("error", (event) => {
+    if (event instanceof ErrorEvent) push("error", [event.error ?? event.message]);
+  });
+  addEventListener("unhandledrejection", (event) => push("error", ["Unhandled promise rejection:", event.reason]));
+  Object.defineProperty(window, KEY, { value: () => entries.slice() });
+  // Tells the extension (through the isolated world) about a JavaScript
+  // dialog before it blocks the page: one that opens while no agent acts
+  // cannot be seen through the debugger.
+  for (const type of ["alert", "confirm", "prompt"]) {
+    const original = window[type];
+    window[type] = function (...args) {
+      const say = (name) => document.dispatchEvent(new CustomEvent(name, { detail: JSON.stringify({ type, message: String(args[0] ?? "") }) }));
+      say("__bmcp_dialog");
+      try {
+        return original.apply(this, args);
+      } finally {
+        say("__bmcp_dialog_closed");
+      }
+    };
+  }
+}
+
+/** Relays the page's dialog notices to the background; runs in the isolated world. */
+function dialogRelaySource() {
+  if (globalThis.__bmcpDialogRelay) return;
+  globalThis.__bmcpDialogRelay = true;
+  for (const name of ["__bmcp_dialog", "__bmcp_dialog_closed"]) {
+    document.addEventListener(name, (event) => {
+      let detail = {};
+      try {
+        detail = JSON.parse(event.detail);
+      } catch {
+        // not ours
+      }
+      chrome.runtime.sendMessage({ cmd: name === "__bmcp_dialog" ? "dialogOpening" : "dialogClosed", ...detail }).catch(() => {});
+    });
+  }
+}
+
+function isAgentTab(tabId) {
+  return state.owner.has(tabId) || state.created.has(tabId) || state.pool.has(tabId);
+}
+
+function installConsoleHook(tabId) {
+  if (!state.hookedAt.has(tabId)) state.hookedAt.set(tabId, Date.now());
+  const target = { tabId, frameIds: [0] };
+  return Promise.all([
+    chrome.scripting.executeScript({ target, world: "ISOLATED", injectImmediately: true, func: dialogRelaySource }),
+    chrome.scripting.executeScript({ target, world: "MAIN", injectImmediately: true, func: consoleHookSource }),
+  ]).catch(() => {});
+}
+
+async function readConsole(tabId) {
+  const [frame] = await chrome.scripting
+    .executeScript({
+      target: { tabId, frameIds: [0] },
+      world: "MAIN",
+      func: () => window[Symbol.for("browsermcp-plus.console")]?.() ?? null,
+    })
+    .catch(() => []);
+  return frame?.result ?? null;
+}
+
+function recordRequest(tabId, entry) {
+  if (tabId < 0 || !isAgentTab(tabId)) return;
+  const list = state.network.get(tabId) ?? [];
+  list.push({ ...entry, timestamp: Date.now() });
+  if (list.length > 300) list.shift();
+  state.network.set(tabId, list);
+}
+
+/** tabId -> Map(requestId -> start time) of the agent tabs' requests in flight. */
+const inflight = new Map();
+
+const onRequestStart = (d) => {
+  if (d.tabId < 0 || !isAgentTab(d.tabId)) return;
+  const map = inflight.get(d.tabId) ?? new Map();
+  map.set(d.requestId, Date.now());
+  inflight.set(d.tabId, map);
+};
+const onRequestError = (d) => {
+  inflight.get(d.tabId)?.delete(d.requestId);
+  recordRequest(d.tabId, { url: d.url, method: d.method, type: d.type, error: d.error });
+};
+const onRequestDone = (d) => {
+  inflight.get(d.tabId)?.delete(d.requestId);
+  if (d.statusCode >= 400) recordRequest(d.tabId, { url: d.url, method: d.method, type: d.type, status: d.statusCode });
+};
+
+/** Whether the page is still loading something it asked for recently (long polls do not count). */
+function loadingRecently(tabId) {
+  const now = Date.now();
+  for (const started of inflight.get(tabId)?.values() ?? []) if (now - started < 3_000) return true;
+  return false;
+}
+let listeningToRequests = false;
+
+/** Watches requests only while agents have tabs: other browsing is left alone. */
+function syncNetworkListeners() {
+  if (!chrome.webRequest) return;
+  const wanted = state.owner.size > 0 || state.created.size > 0;
+  if (wanted === listeningToRequests) return;
+  listeningToRequests = wanted;
+  const filter = { urls: ["<all_urls>"] };
+  if (wanted) {
+    chrome.webRequest.onBeforeRequest.addListener(onRequestStart, filter);
+    chrome.webRequest.onErrorOccurred.addListener(onRequestError, filter);
+    chrome.webRequest.onCompleted.addListener(onRequestDone, filter);
+  } else {
+    chrome.webRequest.onBeforeRequest.removeListener(onRequestStart);
+    chrome.webRequest.onErrorOccurred.removeListener(onRequestError);
+    chrome.webRequest.onCompleted.removeListener(onRequestDone);
+    inflight.clear();
+  }
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -805,14 +1164,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   state.attached.delete(tabId);
   state.contexts.delete(tabId);
-  state.consoleLogs.delete(tabId);
   state.dialogs.delete(tabId);
   state.queues.delete(tabId);
   state.claims.delete(tabId);
   state.badged.delete(tabId);
+  state.lastSnap.delete(tabId);
+  state.frameInfo.delete(tabId);
+  state.network.delete(tabId);
+  state.committedAt.delete(tabId);
+  const handedOff = state.handoffs.delete(tabId);
   const pooled = state.pool.delete(tabId);
   const created = state.created.delete(tabId);
-  if (pooled || created || sessionId) {
+  if (handedOff) refreshBadges();
+  if (pooled || created || sessionId || handedOff) {
     if (!wantsSocket()) closeSocket();
     void persist();
   }
@@ -830,12 +1194,57 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(({ sourceTabId, tabId
     state.created.set(tabId, sessionId);
     void persist();
     refreshBadges();
+    void groupAgentTab(tabId);
   });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.status === "loading" && state.consoleLogs.has(tabId)) state.consoleLogs.set(tabId, []);
   if (info.url) noticeClaim(tabId, info.url);
+});
+
+// A new document in an agent tab: fresh console hook and request log; the
+// last snapshot no longer describes the page.
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
+  if (frameId !== 0) return;
+  state.committedAt.set(tabId, Date.now());
+  state.lastSnap.delete(tabId);
+  state.frameInfo.delete(tabId);
+  state.earlyConsole.delete(tabId);
+  state.hookedAt.delete(tabId);
+  state.activated.delete(tabId);
+  if (state.dialogs.get(tabId)?.unanswerable) state.dialogs.delete(tabId);
+  if (isAgentTab(tabId)) {
+    state.network.set(tabId, []);
+    void installConsoleHook(tabId);
+  }
+});
+
+// The note on a handed-over page comes back after the user navigates it.
+chrome.webNavigation.onCompleted.addListener(({ tabId, frameId }) => {
+  const handoff = frameId === 0 && state.handoffs.get(tabId);
+  if (handoff) runAgent(tabId, 0, "handoffNotice", [handoff.agent, handoff.note, !handoff.seen]).catch(() => {});
+});
+
+// The user switched to a handed-over tab (or to its window): it stops calling for attention.
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  if (state.handoffs.get(tabId)?.seen === false) void handoffSeen(tabId, false);
+});
+
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE || !state.handoffs.size) return;
+  const [tab] = await chrome.tabs.query({ active: true, windowId }).catch(() => []);
+  if (tab && state.handoffs.get(tab.id)?.seen === false) void handoffSeen(tab.id, false);
+});
+
+chrome.tabGroups?.onRemoved.addListener((group) => {
+  if (group.id === state.groupId) {
+    state.groupId = null;
+    void persist();
+  }
+});
+
+chrome.downloads?.onCreated.addListener((item) => {
+  for (const list of state.downloadWatch.values()) list.push(item);
 });
 
 // ---------------------------------------------------------------------------
@@ -852,53 +1261,61 @@ function whenDialogOpens(tabId) {
 }
 
 function dialogError(tabId) {
-  const { type, message } = state.dialogs.get(tabId);
+  const { type, message, unanswerable } = state.dialogs.get(tabId);
+  if (unanswerable) {
+    return new Error(
+      `A JavaScript ${type} dialog is open: ${JSON.stringify(message)}. The page opened it while no agent was acting, so it can only be closed by reloading the page: call browser_handle_dialog to do that, or ask the user to answer it.`,
+    );
+  }
   return new Error(
     `A JavaScript ${type} dialog is open: ${JSON.stringify(message)}. The page is blocked until you call browser_handle_dialog to accept or dismiss it.`,
   );
 }
 
-const NAVIGATION_START = new Set([
-  "Page.frameRequestedNavigation",
-  "Page.frameStartedLoading",
-  "Page.frameStartedNavigating",
-  "Page.frameNavigated",
-]);
-const NAVIGATION_END = new Set([
-  "Page.domContentEventFired",
-  "Page.loadEventFired",
-  "Page.frameStoppedLoading",
-  "Page.downloadWillBegin",
-]);
-
-/** Watches the tab's main frame for a navigation starting and its document becoming ready. */
+/**
+ * Watches the tab's top frame for a navigation starting and its document
+ * becoming ready, through webNavigation: no debugger needed. Same-document
+ * navigations (pushState, #hash) are not navigations here.
+ */
 function trackNavigation(tabId) {
-  const tracker = { started: false };
+  const tracker = { started: false, error: null };
   let markStarted;
   let markDone;
   let markLoaded;
   tracker.whenStarted = new Promise((resolve) => (markStarted = resolve));
   tracker.whenDone = new Promise((resolve) => (markDone = resolve));
   tracker.whenLoaded = new Promise((resolve) => (markLoaded = resolve));
-  const listener = (source, method, params) => {
-    if (source.tabId !== tabId) return;
-    // Only top-level navigations count; DOMContentLoaded/load are main-frame events already.
-    const isMainFrame =
-      method === "Page.frameNavigated"
-        ? !params.frame.parentId
-        : params?.frameId === undefined || params.frameId === state.mainFrames.get(tabId);
-    if (!isMainFrame) return;
-    if (NAVIGATION_START.has(method)) {
-      if (method === "Page.frameStartedNavigating" && /sameDocument/i.test(params.navigationType ?? "")) return;
-      tracker.started = true;
-      markStarted();
-    } else if (NAVIGATION_END.has(method) && tracker.started) {
-      markDone();
-      if (method !== "Page.domContentEventFired") markLoaded();
-    }
+  const ours = (d) => d.tabId === tabId && d.frameId === 0 && d.documentLifecycle !== "prerender";
+  const onStart = (d) => {
+    if (!ours(d)) return;
+    tracker.started = true;
+    markStarted();
   };
-  chrome.debugger.onEvent.addListener(listener);
-  tracker.stop = () => chrome.debugger.onEvent.removeListener(listener);
+  const onReady = (d) => {
+    if (ours(d) && tracker.started) markDone();
+  };
+  const onLoaded = (d) => {
+    if (!ours(d) || !tracker.started) return;
+    markDone();
+    markLoaded();
+  };
+  const onError = (d) => {
+    if (!ours(d) || !tracker.started) return;
+    tracker.error = d.error;
+    markDone();
+    markLoaded();
+  };
+  const nav = chrome.webNavigation;
+  nav.onBeforeNavigate.addListener(onStart);
+  nav.onDOMContentLoaded.addListener(onReady);
+  nav.onCompleted.addListener(onLoaded);
+  nav.onErrorOccurred.addListener(onError);
+  tracker.stop = () => {
+    nav.onBeforeNavigate.removeListener(onStart);
+    nav.onDOMContentLoaded.removeListener(onReady);
+    nav.onCompleted.removeListener(onLoaded);
+    nav.onErrorOccurred.removeListener(onError);
+  };
   return tracker;
 }
 
@@ -945,12 +1362,20 @@ async function settleDom(tabId, quietMs = 60, maxMs = 1_500) {
  * Runs a page action, then lets the page react: follows a navigation the
  * action started, otherwise waits briefly for the DOM to settle. A dialog
  * opened by the action ends the wait (the page is blocked until it is
- * handled). Returns a report of what happened.
+ * handled). Returns a report of what happened: navigation, dialog, new tabs
+ * (the agent moves to a tab the page opened), downloads, and what changed on
+ * the page since the agent's last snapshot.
  */
-async function runAction(tabId, action, { startWindowMs = 80, allowDialog = false } = {}) {
+async function runAction(
+  tabId,
+  action,
+  { startWindowMs = 80, allowDialog = false, session = null, failOnNavigationError = false } = {},
+) {
   if (state.dialogs.has(tabId) && !allowDialog) throw dialogError(tabId);
   const opened = [];
+  const downloads = [];
   state.opened.set(tabId, opened);
+  state.downloadWatch.set(tabId, downloads);
   const tracker = trackNavigation(tabId);
   const dialog = whenDialogOpens(tabId);
   try {
@@ -963,16 +1388,42 @@ async function runAction(tabId, action, { startWindowMs = 80, allowDialog = fals
       if (tracker.started) {
         await waitForDocument(tabId, tracker);
         await settleDom(tabId, 60, 1_000).catch(() => {});
+        if (session) showActivity(tabId, session, "reading");
       }
       return value;
     })();
     work.catch(() => {}); // keeps running in the background if a dialog interrupts it
     const value = await Promise.race([work, dialog.promise.then(() => undefined)]);
-    return await actionReport(tabId, tracker, value, opened);
+    if (failOnNavigationError && tracker.error && !/ERR_ABORTED/.test(tracker.error)) {
+      throw new Error(`Could not open the page: ${tracker.error}. Check the address, or whether the site is reachable.`);
+    }
+    state.actedAt.set(tabId, Date.now());
+    const report = await actionReport(tabId, tracker, value, opened);
+    if (downloads.length) {
+      report.downloads = downloads.map((d) => ({ id: d.id, url: d.finalUrl || d.url, filename: d.filename || "" }));
+    }
+    if (session && opened.length) await switchToNewTab(session, opened, report);
+    else if (!report.navigated && !report.dialog) await reportChanges(tabId, report);
+    return report;
   } finally {
     tracker.stop();
     dialog.cancel();
     if (state.opened.get(tabId) === opened) state.opened.delete(tabId);
+    if (state.downloadWatch.get(tabId) === downloads) state.downloadWatch.delete(tabId);
+  }
+}
+
+/** The page opened a tab (a link to a new tab, a popup): the agent continues there. */
+async function switchToNewTab(session, opened, report) {
+  for (const tabId of [...opened].reverse()) {
+    try {
+      await waitForDocument(tabId);
+      await assign(session, tabId);
+      report.switchedTo = tabInfo(await chrome.tabs.get(tabId), session);
+      return;
+    } catch {
+      // e.g. it closed already: try the previous one
+    }
   }
 }
 
@@ -988,20 +1439,96 @@ async function actionReport(tabId, tracker, value, opened = []) {
   return report;
 }
 
+/** Most lines a change report shows; past that, a snapshot is the better read. */
+const MAX_CHANGE_LINES = 40;
+/** Snapshots slower than this are not taken after every action. */
+const MAX_DIFF_SNAPSHOT_MS = 600;
+
+/** What the action changed on the page, compared with the agent's last snapshot of it. */
+async function reportChanges(tabId, report) {
+  const before = state.lastSnap.get(tabId);
+  if (!before || before.ms > MAX_DIFF_SNAPSHOT_MS) return;
+  try {
+    let changes;
+    if (before.frames > 1) {
+      // Frames from other sites: compare the stitched snapshots here.
+      changes = diffSnapshots(before.text, await pageSnapshot(tabId));
+    } else {
+      // One document: the page agent compares, and skips the work if nothing changed.
+      changes = await callAgent(tabId, "changes", MAX_CHANGE_LINES);
+      if (!changes) return;
+    }
+    report.changes = changes.lines;
+    if (changes.more) report.moreChanges = changes.more;
+  } catch {
+    // The report stands without it.
+  }
+}
+
+/**
+ * Lines added, changed or removed between two snapshots. Elements are matched
+ * by ref (refs are stable), text lines by content.
+ */
+function diffSnapshots(before, after) {
+  const index = (text) => {
+    const byRef = new Map();
+    const texts = new Map();
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (!line || line.startsWith("- /url:")) continue;
+      const ref = /\[ref=([^\]]+)\]/.exec(line)?.[1];
+      if (ref) byRef.set(ref, line);
+      else texts.set(line, (texts.get(line) ?? 0) + 1);
+    }
+    return { byRef, texts };
+  };
+  const old = index(before);
+  const now = index(after);
+  const lines = [];
+  for (const [ref, line] of now.byRef) {
+    const was = old.byRef.get(ref);
+    if (was === undefined) lines.push(`+ ${line.slice(2)}`);
+    else if (was !== line) lines.push(`~ ${line.slice(2)}`);
+  }
+  for (const [line, count] of now.texts) {
+    if (count > (old.texts.get(line) ?? 0)) lines.push(`+ ${line.slice(2)}`);
+  }
+  for (const [ref, line] of old.byRef) if (!now.byRef.has(ref)) lines.push(`- ${line.slice(2)}`);
+  for (const [line, count] of old.texts) {
+    if (count > (now.texts.get(line) ?? 0)) lines.push(`- ${line.slice(2)}`);
+  }
+  return { lines: lines.slice(0, MAX_CHANGE_LINES), more: Math.max(0, lines.length - MAX_CHANGE_LINES) };
+}
 // ---------------------------------------------------------------------------
 // Page agent
 
 const NAVIGATION_ERROR = /removed|No frame|Frame with ID|did not respond|navigat|context was destroyed/i;
 
-/** Calls the page agent in a tab; blocked by an open dialog, retried once if the page was navigating. */
-async function callAgent(tabId, method, ...args) {
+/** The frame a ref belongs to: refs of subframes are "f<frameId>e<n>". */
+function frameOfRef(ref) {
+  const match = /^f(\d+)e\d+$/.exec(ref ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+/** Calls the page agent in the tab's top frame. */
+function callAgent(tabId, method, ...args) {
+  return callFrame(tabId, 0, method, args);
+}
+
+/** Calls the page agent in the frame that owns `ref`, with the ref as first argument. */
+function callRef(tabId, ref, method, ...args) {
+  return callFrame(tabId, frameOfRef(ref), method, [ref, ...args]);
+}
+
+/** Calls a frame's page agent; blocked by an open dialog, retried once if the page was navigating. */
+async function callFrame(tabId, frameId, method, args) {
   if (state.dialogs.has(tabId)) throw dialogError(tabId);
   const dialog = whenDialogOpens(tabId);
   try {
     for (let attempt = 0; ; attempt++) {
       try {
         return await Promise.race([
-          runAgent(tabId, method, args),
+          watchForDialog(tabId, runAgent(tabId, frameId, method, args)),
           dialog.promise.then(() => {
             throw dialogError(tabId);
           }),
@@ -1012,6 +1539,9 @@ async function callAgent(tabId, method, ...args) {
           const { url } = await chrome.tabs.get(tabId);
           throw new Error(`This page (${url}) can't be read or controlled by extensions. Navigate to a website first.`);
         }
+        if (frameId !== 0 && /No frame|Frame with ID/i.test(message)) {
+          throw new Error("The frame this element was in has gone (the page changed). Take a new snapshot.");
+        }
         if (attempt > 0 || state.dialogs.has(tabId) || !NAVIGATION_ERROR.test(message)) throw error;
         await waitForDocument(tabId);
       }
@@ -1021,13 +1551,23 @@ async function callAgent(tabId, method, ...args) {
   }
 }
 
-async function runAgent(tabId, method, args) {
+/**
+ * A page blocked by alert()/confirm() never answers a script. The page's
+ * dialog notices (see consoleHookSource) end the wait with a clear error.
+ */
+function watchForDialog(tabId, promise) {
+  return promise;
+}
+
+async function runAgent(tabId, frameId, method, args) {
+  const prefix = frameId ? `f${frameId}` : "";
   const run = () =>
     chrome.scripting.executeScript({
-      target: { tabId },
-      func: (name, params) => {
+      target: { tabId, frameIds: [frameId] },
+      func: (name, params, refPrefix) => {
         const agent = globalThis.__bmcp;
         if (!agent) return { missing: true };
+        agent.setPrefix?.(refPrefix);
         try {
           const value = agent[name](...params);
           if (value && typeof value.then === "function") {
@@ -1041,11 +1581,11 @@ async function runAgent(tabId, method, args) {
           return { error: String(e?.message ?? e) };
         }
       },
-      args: [method, args],
+      args: [method, args, prefix],
     });
   let [frame] = await run();
   if (frame?.result?.missing) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content/agent.js"] });
+    await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content/agent.js"] });
     [frame] = await run();
   }
   const result = frame?.result;
@@ -1054,34 +1594,211 @@ async function runAgent(tabId, method, args) {
   return result.value;
 }
 
+/** Frames of the tab that hold a live document. */
+async function framesOf(tabId) {
+  const frames = (await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null)) ?? [];
+  return frames.filter(
+    (f) => !f.errorOccurred && f.documentLifecycle !== "prerender" && f.documentLifecycle !== "pending_deletion",
+  );
+}
+
+/** Runs an agent method in each frame; frames that cannot be scripted give null. */
+async function inEveryFrame(tabId, frames, method, args = []) {
+  return Promise.all(frames.map((f) => runAgent(tabId, f.frameId, method, args).catch(() => null)));
+}
+
+/**
+ * Introduces frames to their parents (postMessage handshake), so each
+ * parent knows which of its <iframe>s holds which child's agent.
+ */
+async function introduceFrames(tabId, frames) {
+  const asked = await inEveryFrame(tabId, frames, "probe");
+  if (asked.some((n) => n > 0)) await sleep(40);
+}
+
+/**
+ * The page's snapshot, including frames from other sites: each runs its own
+ * agent, and its snapshot replaces the placeholder its parent left.
+ */
+async function pageSnapshot(tabId) {
+  const started = Date.now();
+  const frames = await framesOf(tabId);
+  let text = null;
+  if (frames.length > 1) {
+    await introduceFrames(tabId, frames);
+    const results = await inEveryFrame(tabId, frames, "frameSnapshot");
+    text = stitchFrames(tabId, frames, results, /^( *)- <<frame:([^>]+)>>$/gm, {
+      missing: (pad) => `${pad}- text: (a frame from another site that cannot be read)`,
+      place: (pad, child) => indentLines(child, pad),
+      append: (url, child) => `- iframe "${url}":\n${indentLines(child, "  ")}`,
+    });
+  }
+  if (text === null) text = await callAgent(tabId, "snapshot");
+  // Single-document pages keep their baseline in the page agent; the text is kept for frames.
+  state.lastSnap.set(tabId, { text: frames.length > 1 ? text : "", frames: frames.length, ms: Date.now() - started });
+  return text;
+}
+
+/** The page's readable text, frames from other sites included. */
+async function pageText(tabId, options = {}) {
+  const top = await callAgent(tabId, "readText", options);
+  if (!/\[\[bmcp-frame:/.test(top.text)) return top;
+  const frames = await framesOf(tabId);
+  await introduceFrames(tabId, frames);
+  // The top frame's text again, now that it knows its frames' tokens.
+  const results = await inEveryFrame(tabId, frames, "frameText", [{ links: options.links }]);
+  const index = frames.findIndex((f) => f.frameId === 0);
+  if (index >= 0) results[index] = { token: results[index]?.token, ...(await callAgent(tabId, "readText", options)) };
+  const text = stitchFrames(tabId, frames, results, /^()\[\[bmcp-frame:([^\]]+)\]\]$/gm, {
+    missing: () => "(a frame from another site that cannot be read)",
+    place: (_pad, child) => child,
+    append: (url, child) => `\n[frame: ${url}]\n${child}`,
+  });
+  return { ...top, text: text ?? top.text };
+}
+
+/**
+ * Replaces each frame placeholder in the top frame's output with that
+ * frame's output, recursively. Frames whose parent could not place them are
+ * appended. Returns null if the top frame gave nothing.
+ */
+function stitchFrames(tabId, frames, results, pattern, { missing, place, append }) {
+  const info = new Map();
+  const byToken = new Map();
+  let top = null;
+  frames.forEach((frame, i) => {
+    const result = results[i];
+    if (!result) return;
+    info.set(frame.frameId, { token: result.token, inlined: !!result.inlined, parent: frame.parentFrameId, url: frame.url });
+    if (frame.frameId === 0) top = result;
+    else if (!result.inlined) byToken.set(result.token, { frame, output: result.text ?? "" });
+  });
+  state.frameInfo.set(tabId, info);
+  if (!top) return null;
+  const used = new Set();
+  const expand = (output, depth) =>
+    output.replace(pattern, (_match, pad, token) => {
+      const child = byToken.get(token);
+      if (!child || depth > 10) return missing(pad);
+      used.add(token);
+      return child.output ? place(pad, expand(child.output, depth + 1)) : "";
+    });
+  let output = expand(top.text ?? "", 0);
+  for (const [token, child] of byToken) {
+    if (used.has(token) || !child.output) continue;
+    used.add(token);
+    output += `\n${append(child.frame.url, expand(child.output, 1))}`;
+  }
+  return output.replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+}
+
+function indentLines(text, pad) {
+  return text
+    .split("\n")
+    .map((line) => (line ? pad + line : line))
+    .join("\n");
+}
+
+/**
+ * For an element in a frame from another site: the chain of (frame, the
+ * frame whose agent knows its <iframe>) links up to the top frame.
+ */
+async function frameChain(tabId, frameId) {
+  let info = state.frameInfo.get(tabId);
+  if (!info?.has(frameId)) {
+    const frames = await framesOf(tabId);
+    await introduceFrames(tabId, frames);
+    const results = await inEveryFrame(tabId, frames, "info");
+    info = new Map();
+    frames.forEach((frame, i) => {
+      if (results[i]) {
+        info.set(frame.frameId, { token: results[i].token, inlined: results[i].inlined, parent: frame.parentFrameId, url: frame.url });
+      }
+    });
+    state.frameInfo.set(tabId, info);
+  }
+  const chain = [];
+  for (let id = frameId; id > 0; ) {
+    const entry = info.get(id);
+    if (!entry) throw new Error("The frame this element is in has gone (the page changed). Take a new snapshot.");
+    // The nearest ancestor that is not inlined into its own parent knows the <iframe>.
+    let mapper = entry.parent;
+    while (mapper > 0 && info.get(mapper)?.inlined) mapper = info.get(mapper).parent;
+    mapper = Math.max(mapper, 0);
+    chain.push({ token: entry.token, mapper });
+    id = mapper;
+  }
+  return chain;
+}
+
+/** Translates a point in a frame's viewport to the tab's viewport, checking no ancestor covers the frame. */
+async function toTopPoint(tabId, ref, point, { check = false } = {}) {
+  const frameId = frameOfRef(ref);
+  if (!frameId) return point;
+  const chain = await frameChain(tabId, frameId);
+  let { x, y } = point;
+  for (const link of chain) {
+    const offset = await runAgent(tabId, link.mapper, "frameOffset", [link.token, false]);
+    x += offset.x;
+    y += offset.y;
+    if (check) {
+      const blocker = await runAgent(tabId, link.mapper, "frameBlocker", [link.token, x, y]);
+      if (blocker) {
+        throw new Error(`Element "${ref}" is in a frame covered by ${blocker}, which would receive the click. Dismiss or close it first.`);
+      }
+    }
+  }
+  return { ...point, x, y };
+}
+
+/** Scrolls the frames holding `ref` into view, outermost first. */
+async function revealFrames(tabId, ref) {
+  const frameId = frameOfRef(ref);
+  if (!frameId) return;
+  const chain = await frameChain(tabId, frameId);
+  for (const link of [...chain].reverse()) await runAgent(tabId, link.mapper, "frameOffset", [link.token, true]);
+}
+
 /**
  * Where to click an element: scrolls it into view, waits until its position
  * is stable and, with `check`, makes sure it is enabled and not covered by
  * another element. The waiting is timed here rather than in the page, whose
- * timers are throttled in background tabs.
+ * timers are throttled in background tabs. Elements in frames from other
+ * sites are translated to the tab's viewport, where Chrome routes the input.
  */
 async function pointFor(tabId, ref, check = true) {
-  await callAgent(tabId, "prepareTarget", ref, check);
-  let point = await callAgent(tabId, "center", ref);
+  await revealFrames(tabId, ref);
+  await callRef(tabId, ref, "prepareTarget", check);
+  let point = await callRef(tabId, ref, "center");
   for (let i = 0; i < 6; i++) {
     await sleep(30);
-    const next = await callAgent(tabId, "center", ref);
+    const next = await callRef(tabId, ref, "center");
     if (next.x === point.x && next.y === point.y) break;
     point = next;
   }
-  if (!check) return point;
-  for (let attempt = 0; ; attempt++) {
-    const blocker = await callAgent(tabId, "blocker", ref);
-    if (!blocker) return callAgent(tabId, "center", ref);
-    if (attempt >= 4) {
-      throw new Error(`Element "${ref}" is covered by ${blocker}, which would receive the click. Dismiss or close it first.`);
+  if (check) {
+    for (let attempt = 0; ; attempt++) {
+      const blocker = await callRef(tabId, ref, "blocker");
+      if (!blocker) {
+        point = await callRef(tabId, ref, "center");
+        break;
+      }
+      if (attempt >= 4) {
+        throw new Error(`Element "${ref}" is covered by ${blocker}, which would receive the click. Dismiss or close it first.`);
+      }
+      await sleep(100);
     }
-    await sleep(100);
   }
+  return toTopPoint(tabId, ref, point, { check });
 }
 
 /** CDP handle for the element behind a snapshot ref, in the page's own (main) world. */
 async function resolveRef(tabId, ref, { mainWorld = false } = {}) {
+  if (frameOfRef(ref)) {
+    throw new Error(
+      `Element "${ref}" is in a frame from another site. Uploading files and evaluate with a ref work on the page's own elements; click and type work everywhere.`,
+    );
+  }
   // Validates the ref (and injects the agent) with a readable error first.
   await callAgent(tabId, "check", ref);
   const contextId = await agentContextId(tabId);
@@ -1119,12 +1836,14 @@ function exceptionText(details) {
 // Input helpers
 
 async function mouseClick(tabId, { x, y }) {
+  state.activated.add(tabId);
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
 }
 
 async function pressKey(tabId, key) {
+  state.activated.add(tabId);
   for (const event of keyEvents(key)) {
     await cdp(tabId, "Input.dispatchKeyEvent", event);
   }
@@ -1162,10 +1881,10 @@ async function drag(tabId, from, to) {
 
 /** Types into a field the way a user would: click to focus, select the old content, then type. */
 async function typeInto(tabId, ref, text, { submit = false, slowly = false } = {}) {
-  const kind = await callAgent(tabId, "editKind", ref);
+  const kind = await callRef(tabId, ref, "editKind");
   if (kind === "direct") {
     // Date, time, colour and range inputs cannot be typed into reliably.
-    await callAgent(tabId, "setValue", ref, text);
+    await callRef(tabId, ref, "setValue", text);
   } else {
     try {
       await mouseClick(tabId, await pointFor(tabId, ref));
@@ -1173,7 +1892,7 @@ async function typeInto(tabId, ref, text, { submit = false, slowly = false } = {
       // A floating label or similar overlay: focusing programmatically is fine for typing.
       if (!/covered by/.test(errorMessage(error))) throw error;
     }
-    const hadContent = await callAgent(tabId, "selectContent", ref);
+    const hadContent = await callRef(tabId, ref, "selectContent");
     if (!text) {
       if (hadContent) await pressKey(tabId, "Backspace");
     } else if (slowly) {
@@ -1184,7 +1903,7 @@ async function typeInto(tabId, ref, text, { submit = false, slowly = false } = {
       await cdp(tabId, "Input.insertText", { text });
     }
   }
-  const value = await callAgent(tabId, "fieldValue", ref).catch(() => undefined);
+  const value = await callRef(tabId, ref, "fieldValue").catch(() => undefined);
   if (submit) await pressKey(tabId, "Enter");
   return value;
 }
@@ -1200,26 +1919,26 @@ async function fillField(tabId, { name, type, ref, value }) {
     case "switch": {
       const want = value === "true";
       if (type === "radio" && !want) return `${name}: unchanged (a radio button is cleared by selecting another one)`;
-      if ((await callAgent(tabId, "isChecked", ref)) !== want) await mouseClick(tabId, await pointFor(tabId, ref));
-      if ((await callAgent(tabId, "isChecked", ref)) !== want) throw new Error(`could not ${want ? "check" : "uncheck"} it`);
+      if ((await callRef(tabId, ref, "isChecked")) !== want) await mouseClick(tabId, await pointFor(tabId, ref));
+      if ((await callRef(tabId, ref, "isChecked")) !== want) throw new Error(`could not ${want ? "check" : "uncheck"} it`);
       return `${name}: ${want ? "checked" : "unchecked"}`;
     }
     case "combobox":
     case "listbox": {
-      if (!(await callAgent(tabId, "isNativeSelect", ref))) {
+      if (!(await callRef(tabId, ref, "isNativeSelect"))) {
         throw new Error("not a native <select>; open it with browser_click and click the option instead");
       }
-      return `${name}: ${(await callAgent(tabId, "selectOptions", ref, [value])).join(", ")}`;
+      return `${name}: ${(await callRef(tabId, ref, "selectOptions", [value])).join(", ")}`;
     }
     case "slider":
-      return `${name}: ${await callAgent(tabId, "setValue", ref, value)}`;
+      return `${name}: ${await callRef(tabId, ref, "setValue", value)}`;
     default:
       throw new Error(`unsupported field type "${type}"`);
   }
 }
 
 async function uploadFiles(tabId, ref, paths) {
-  if (await callAgent(tabId, "isFileInput", ref)) {
+  if (await callRef(tabId, ref, "isFileInput")) {
     const objectId = await resolveRef(tabId, ref);
     await cdp(tabId, "DOM.setFileInputFiles", { files: paths, objectId });
     return;
@@ -1249,8 +1968,21 @@ function sleep(ms) {
 // ---------------------------------------------------------------------------
 // Message handlers. Each gets the payload and { session, tabId }.
 
+/**
+ * A tab as agents see it, with who it belongs to: the asking agent ("you"),
+ * another agent, the user (connected for agents, or not), or the user after
+ * an agent handed it over.
+ */
 function tabInfo(tab, session) {
-  const owner = state.sessions.get(state.owner.get(tab.id) ?? state.created.get(tab.id));
+  const workerId = state.owner.get(tab.id);
+  const openerId = state.created.get(tab.id);
+  const agent = state.sessions.get(workerId ?? openerId);
+  const handoff = state.handoffs.get(tab.id);
+  let owner = "user";
+  if (agent && agent.id === session?.id) owner = "you";
+  else if (agent) owner = "agent";
+  else if (handoff) owner = "handed-off";
+  else if (state.pool.has(tab.id)) owner = "user-connected";
   return {
     id: tab.id,
     windowId: tab.windowId,
@@ -1258,9 +1990,130 @@ function tabInfo(tab, session) {
     // A tab that is still loading has an empty url and the target in pendingUrl.
     url: tab.url || tab.pendingUrl || "",
     active: tab.active,
-    connected: !!session && state.owner.get(tab.id) === session.id,
-    ...(owner && owner.id !== session?.id ? { agent: owner.name } : {}),
+    connected: !!session && workerId === session.id,
+    owner,
+    ...(agent && agent.id !== session?.id ? { agent: agent.name } : {}),
+    ...(handoff ? { note: handoff.note, handedOffBy: handoff.agent } : {}),
+    ...(tab.groupId !== -1 && tab.groupId === state.groupId ? { grouped: true } : {}),
   };
+}
+
+/** The page loaded moments ago, the agent has not acted on it yet, and it is still fetching or changing. */
+async function stillLoading(tabId) {
+  const committed = state.committedAt.get(tabId);
+  if (!committed || Date.now() - committed > 10_000 || (state.actedAt.get(tabId) ?? 0) > committed) return false;
+  if (loadingRecently(tabId)) return true;
+  return (await callAgent(tabId, "quietFor").catch(() => Infinity)) < 300;
+}
+
+/** A page that loaded moments ago and is still changing (an editor, an app view) gets a moment to settle before a read. */
+async function settleIfFresh(tabId) {
+  const committed = state.committedAt.get(tabId);
+  if (!committed || Date.now() - committed > FRESH_PAGE_MS) return;
+  // After the agent's own action, that action already waited for the page.
+  if ((state.actedAt.get(tabId) ?? 0) > committed) return;
+  const quiet = await callAgent(tabId, "quietFor").catch(() => Infinity);
+  if (quiet < 150) await settleDom(tabId, 150, 1_200).catch(() => {});
+}
+
+/** The element's box in the tab's viewport, scrolled into view. */
+async function boxFor(tabId, ref) {
+  await revealFrames(tabId, ref);
+  const box = await callRef(tabId, ref, "boxIn");
+  return toTopPoint(tabId, ref, box);
+}
+
+async function withoutOverlay(tabId, fn) {
+  await runAgent(tabId, 0, "overlayHidden", [true]).catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    runAgent(tabId, 0, "overlayHidden", [false]).catch(() => {});
+  }
+}
+
+/** Fetches a file with the profile's logins: in the page for its own and blob: URLs, else from here. */
+async function fetchFile(tabId, url) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  let pageOrigin = null;
+  try {
+    pageOrigin = new URL(tab?.url ?? "").origin;
+  } catch {
+    // no page
+  }
+  const target = new URL(url, tab?.url);
+  const inPage = target.protocol === "blob:" || target.protocol === "data:" || target.origin === pageOrigin;
+  if (inPage) {
+    const [frame] = await chrome.scripting
+      .executeScript({
+        target: { tabId, frameIds: [0] },
+        func: async (address, max) => {
+          try {
+            const response = await fetch(address, { credentials: "include" });
+            if (!response.ok) return { error: `HTTP ${response.status}` };
+            const blob = await response.blob();
+            if (blob.size > max) return { error: `too large (${blob.size} bytes)` };
+            const dataUrl = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = () => reject(reader.error);
+              reader.readAsDataURL(blob);
+            });
+            return {
+              base64: String(dataUrl).slice(String(dataUrl).indexOf(",") + 1),
+              mimeType: blob.type || response.headers.get("content-type") || "",
+              disposition: response.headers.get("content-disposition") || "",
+              size: blob.size,
+            };
+          } catch (error) {
+            return { error: String(error?.message ?? error) };
+          }
+        },
+        args: [target.href, MAX_FILE_BYTES],
+      })
+      .catch(() => []);
+    if (frame?.result && !frame.result.error) return { url: target.href, ...frame.result };
+  }
+  const response = await fetch(target.href, { credentials: "include" });
+  if (!response.ok) throw new Error(`Could not get ${target.href}: HTTP ${response.status}.`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.length > MAX_FILE_BYTES) {
+    throw new Error(`The file is ${Math.round(bytes.length / 1e6)} MB; files up to ${MAX_FILE_BYTES / 1e6} MB can be read. Use browser_download.`);
+  }
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return {
+    url: target.href,
+    base64: btoa(binary),
+    mimeType: response.headers.get("content-type") || "",
+    disposition: response.headers.get("content-disposition") || "",
+    size: bytes.length,
+  };
+}
+
+function downloadInfo(item) {
+  return {
+    id: item.id,
+    url: item.finalUrl || item.url,
+    path: item.filename || "",
+    state: item.state,
+    bytes: item.bytesReceived,
+    totalBytes: item.totalBytes,
+    mimeType: item.mime || "",
+    startTime: item.startTime,
+    ...(item.error ? { error: item.error } : {}),
+    ...(item.danger && item.danger !== "safe" && item.danger !== "accepted" ? { danger: item.danger } : {}),
+  };
+}
+
+/** Waits for a download to finish, at most `timeoutMs`; returns its latest state. */
+async function settleDownload(id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [item] = await chrome.downloads.search({ id });
+    if (!item || item.state !== "in_progress" || Date.now() > deadline) return item;
+    await sleep(250);
+  }
 }
 
 const handlers = {
@@ -1270,95 +2123,162 @@ const handlers = {
   async getTitle(_payload, { tabId }) {
     return (await chrome.tabs.get(tabId)).title;
   },
-  async browser_snapshot(_payload, { tabId }) {
+  async browser_snapshot({ expect } = {}, { tabId }) {
     if (state.dialogs.has(tabId)) throw dialogError(tabId);
-    return callAgent(tabId, "snapshot");
-  },
-  async browser_navigate({ url }, { tabId }) {
-    const attached = await ensureAttached(tabId).then(
-      () => true,
-      () => false,
-    );
-    if (!attached) {
-      // The current page can't be debugged (chrome://, Web Store): navigate without CDP.
-      await chrome.tabs.update(tabId, { url });
-      await waitForDocument(tabId);
-      return actionReport(tabId, { started: true }, undefined);
+    await settleIfFresh(tabId);
+    let text = await pageSnapshot(tabId);
+    // Looking for something on a page that has just loaded and is still
+    // fetching or building (an editor from a CDN, an app view): give it a moment.
+    const deadline = Date.now() + 1_500;
+    while (expect && !text.toLowerCase().includes(String(expect).toLowerCase()) && Date.now() < deadline && (await stillLoading(tabId))) {
+      await sleep(250);
+      text = await pageSnapshot(tabId);
     }
-    return runAction(
-      tabId,
-      async () => {
-        const result = await cdp(tabId, "Page.navigate", { url }).catch(() => null);
-        if (!result) {
-          await chrome.tabs.update(tabId, { url });
-        } else if (result.errorText && result.errorText !== "net::ERR_ABORTED") {
-          throw new Error(`Could not open ${url}: ${result.errorText}`);
-        }
-      },
-      { startWindowMs: 1_000 },
-    );
+    return text;
   },
-  async browser_go_back(_payload, { tabId }) {
-    await ensureAttached(tabId);
-    return runAction(tabId, () => chrome.tabs.goBack(tabId), { startWindowMs: 1_000 });
+  async browser_get_text({ ref, selector, links }, { tabId }) {
+    if (state.dialogs.has(tabId)) throw dialogError(tabId);
+    await settleIfFresh(tabId);
+    if (ref && frameOfRef(ref)) {
+      return { ...(await callRef(tabId, ref, "readText")), ref };
+    }
+    return pageText(tabId, { ref, selector, links });
   },
-  async browser_go_forward(_payload, { tabId }) {
-    await ensureAttached(tabId);
-    return runAction(tabId, () => chrome.tabs.goForward(tabId), { startWindowMs: 1_000 });
+  async browser_navigate({ url }, { tabId, session }) {
+    // Navigation is tracked through webNavigation. After the agent's input the
+    // page may ask "Leave site?": the debugger is what sees that dialog.
+    if (state.activated.has(tabId)) await ensureAttached(tabId);
+    return runAction(tabId, () => chrome.tabs.update(tabId, { url }), {
+      startWindowMs: 1_000,
+      session,
+      failOnNavigationError: true,
+    });
+  },
+  async browser_go_back(_payload, { tabId, session }) {
+    if (state.activated.has(tabId)) await ensureAttached(tabId);
+    return runAction(tabId, () => chrome.tabs.goBack(tabId), { startWindowMs: 1_000, session });
+  },
+  async browser_go_forward(_payload, { tabId, session }) {
+    if (state.activated.has(tabId)) await ensureAttached(tabId);
+    return runAction(tabId, () => chrome.tabs.goForward(tabId), { startWindowMs: 1_000, session });
   },
   async browser_wait({ time }) {
     await sleep(Math.max(0, Number(time) || 0) * 1000);
   },
-  async browser_press_key({ key }, { tabId }) {
+  async browser_press_key({ key }, { tabId, session }) {
     await ensureAttached(tabId);
-    return runAction(tabId, () => pressKey(tabId, key));
+    return runAction(tabId, () => pressKey(tabId, key), { session });
   },
-  async browser_click({ ref }, { tabId }) {
+  async browser_click({ ref }, { tabId, session }) {
     await ensureAttached(tabId);
-    return runAction(tabId, async () => mouseClick(tabId, await pointFor(tabId, ref)));
+    return runAction(tabId, async () => mouseClick(tabId, await pointFor(tabId, ref)), { session });
   },
-  async browser_hover({ ref }, { tabId }) {
+  async browser_hover({ ref }, { tabId, session }) {
     await ensureAttached(tabId);
-    return runAction(tabId, async () => {
-      const { x, y } = await pointFor(tabId, ref, false);
-      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    });
+    return runAction(
+      tabId,
+      async () => {
+        const { x, y } = await pointFor(tabId, ref, false);
+        await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      },
+      { session },
+    );
   },
-  async browser_drag({ startRef, endRef }, { tabId }) {
+  async browser_drag({ startRef, endRef }, { tabId, session }) {
+    if (frameOfRef(startRef) !== frameOfRef(endRef)) {
+      throw new Error("Both ends of a drag must be in the same frame.");
+    }
     await ensureAttached(tabId);
-    return runAction(tabId, async () => {
-      const { from, to } = await callAgent(tabId, "dragPoints", startRef, endRef);
-      await drag(tabId, from, to);
-    });
+    return runAction(
+      tabId,
+      async () => {
+        await revealFrames(tabId, startRef);
+        const points = await callRef(tabId, startRef, "dragPoints", endRef);
+        const from = await toTopPoint(tabId, startRef, points.from);
+        const to = await toTopPoint(tabId, startRef, points.to);
+        await drag(tabId, from, to);
+      },
+      { session },
+    );
   },
-  async browser_type({ ref, text, submit, slowly }, { tabId }) {
+  async browser_type({ ref, text, submit, slowly }, { tabId, session }) {
     await ensureAttached(tabId);
-    return runAction(tabId, () => typeInto(tabId, ref, text, { submit, slowly }));
+    return runAction(tabId, () => typeInto(tabId, ref, text, { submit, slowly }), { session });
   },
-  async browser_select_option({ ref, values }, { tabId }) {
-    await ensureAttached(tabId);
-    return runAction(tabId, () => callAgent(tabId, "selectOptions", ref, values));
+  async browser_select_option({ ref, values }, { tabId, session }) {
+    // A DOM-level change: no debugger.
+    return runAction(tabId, () => callRef(tabId, ref, "selectOptions", values), { session });
   },
-  async browser_screenshot(_payload, { tabId }) {
+  async browser_screenshot({ ref, fullPage } = {}, { tabId }) {
     await ensureAttached(tabId);
     if (state.dialogs.has(tabId)) throw dialogError(tabId);
-    const { data } = await cdp(tabId, "Page.captureScreenshot", { format: "png" });
+    const params = { format: "png" };
+    if (ref) {
+      const box = await boxFor(tabId, ref);
+      const { cssVisualViewport } = await cdp(tabId, "Page.getLayoutMetrics");
+      params.clip = {
+        x: box.x + cssVisualViewport.pageX,
+        y: box.y + cssVisualViewport.pageY,
+        width: box.width,
+        height: box.height,
+        scale: 1,
+      };
+      params.captureBeyondViewport = true;
+    } else if (fullPage) {
+      const { cssContentSize } = await cdp(tabId, "Page.getLayoutMetrics");
+      params.clip = { x: 0, y: 0, width: cssContentSize.width, height: Math.min(cssContentSize.height, 16_384), scale: 1 };
+      params.captureBeyondViewport = true;
+    }
+    // The working-agent overlay stays out of the picture.
+    const { data } = await withoutOverlay(tabId, async () => {
+      await sleep(30);
+      return cdp(tabId, "Page.captureScreenshot", params);
+    });
     return data;
   },
   async browser_get_console_logs(_payload, { tabId }) {
-    return state.consoleLogs.get(tabId) ?? [];
+    let entries = await readConsole(tabId);
+    if (entries === null) {
+      // Not hooked yet (the page loaded before the agent came): from now on.
+      await installConsoleHook(tabId);
+      entries = [];
+    }
+    const failed = (state.network.get(tabId) ?? []).map((r) => ({
+      type: "network",
+      timestamp: r.timestamp,
+      message: `${r.method ?? "GET"} ${r.url} ${r.status ? `→ HTTP ${r.status}` : `→ ${r.error}`}${r.type ? ` (${r.type})` : ""}`,
+    }));
+    const early = state.earlyConsole.get(tabId) ?? [];
+    return [...early, ...entries, ...failed].sort((a, b) => a.timestamp - b.timestamp);
   },
 
   // --- Browser MCP Plus-only messages -------------------------------------
 
-  async browser_upload_file({ ref, paths }, { tabId }) {
+  async browser_upload_file({ ref, paths }, { tabId, session }) {
+    if (frameOfRef(ref)) {
+      throw new Error(
+        `Element "${ref}" is in a frame from another site; file uploads work on the page's own file inputs. Open the frame's address in a tab of its own (browser_tab_new) and upload there.`,
+      );
+    }
     await ensureAttached(tabId);
-    return runAction(tabId, () => uploadFiles(tabId, ref, paths));
+    return runAction(tabId, () => uploadFiles(tabId, ref, paths), { session });
   },
 
-  async browser_handle_dialog({ accept, promptText }, { tabId }) {
+  async browser_handle_dialog({ accept, promptText }, { tabId, session }) {
     const dialog = state.dialogs.get(tabId);
     if (!dialog) throw new Error("No dialog is open.");
+    if (dialog.unanswerable) {
+      // Opened while no debugger was attached: only leaving the page closes it.
+      return runAction(
+        tabId,
+        async () => {
+          state.dialogs.delete(tabId);
+          await chrome.tabs.reload(tabId);
+          return `Reloaded the page to close the ${dialog.type} dialog ${JSON.stringify(dialog.message)} (it opened while no agent was acting, so it could not be ${accept ? "accepted" : "dismissed"} as such).`;
+        },
+        { allowDialog: true, startWindowMs: 1_000, session },
+      );
+    }
     return runAction(
       tabId,
       async () => {
@@ -1366,27 +2286,32 @@ const handlers = {
         state.dialogs.delete(tabId);
         return `${accept ? "Accepted" : "Dismissed"} the ${dialog.type} dialog ${JSON.stringify(dialog.message)}`;
       },
-      { allowDialog: true, startWindowMs: 300 },
+      { allowDialog: true, startWindowMs: 300, session },
     );
   },
 
-  async browser_fill_form({ fields }, { tabId }) {
+  async browser_fill_form({ fields }, { tabId, session }) {
     await ensureAttached(tabId);
-    return runAction(tabId, async () => {
-      const done = [];
-      for (const field of fields) {
-        try {
-          done.push(await fillField(tabId, field));
-        } catch (error) {
-          const filled = done.length ? ` Filled so far: ${done.join("; ")}.` : "";
-          throw new Error(`Field "${field.name}" failed: ${errorMessage(error)}.${filled}`);
+    return runAction(
+      tabId,
+      async () => {
+        const done = [];
+        for (const field of fields) {
+          try {
+            done.push(await fillField(tabId, field));
+          } catch (error) {
+            const filled = done.length ? ` Filled so far: ${done.join("; ")}.` : "";
+            throw new Error(`Field "${field.name}" failed: ${errorMessage(error)}.${filled}`);
+          }
         }
-      }
-      return done;
-    });
+        return done;
+      },
+      { session },
+    );
   },
 
   async browser_evaluate({ function: source, ref }, { tabId }) {
+    if (ref) await callRef(tabId, ref, "guardSecret");
     await ensureAttached(tabId);
     if (state.dialogs.has(tabId)) throw dialogError(tabId);
     const options = { awaitPromise: true, returnByValue: true, userGesture: true };
@@ -1410,21 +2335,55 @@ const handlers = {
     return { type, value, unserializableValue, description };
   },
 
-  async browser_scroll({ ref, deltaX = 0, deltaY = 0 }, { tabId }) {
+  async browser_scroll({ ref, deltaX = 0, deltaY = 0 }, { tabId, session }) {
+    if (ref) {
+      return runAction(
+        tabId,
+        async () => {
+          await revealFrames(tabId, ref);
+          await callRef(tabId, ref, "scrollIntoView");
+        },
+        { session },
+      );
+    }
     await ensureAttached(tabId);
-    return runAction(tabId, async () => {
-      if (ref) {
-        await callAgent(tabId, "scrollIntoView", ref);
-        return;
-      }
-      const { width, height } = await callAgent(tabId, "viewport");
-      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: width / 2, y: height / 2, deltaX, deltaY });
-    });
+    return runAction(
+      tabId,
+      async () => {
+        const { width, height } = await callAgent(tabId, "viewport");
+        await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: width / 2, y: height / 2, deltaX, deltaY });
+      },
+      { session },
+    );
+  },
+
+  async browser_get_file({ url, ref }, { tabId }) {
+    let target = url;
+    if (!target && ref) target = await callRef(tabId, ref, "resourceOf");
+    if (!target) target = (await chrome.tabs.get(tabId)).url;
+    if (!target || !/^(https?|file|blob|data):/.test(target)) {
+      throw new Error("Give the file's URL, or the ref of an image or link that points to it.");
+    }
+    return fetchFile(tabId, target);
+  },
+
+  async browser_downloads({ limit = 10 }) {
+    if (!chrome.downloads) throw new Error("This build of the extension cannot see downloads.");
+    const items = await chrome.downloads.search({ orderBy: ["-startTime"], limit: Math.min(Math.max(limit, 1), 50) });
+    return items.map(downloadInfo);
+  },
+
+  async browser_download({ url }) {
+    if (!chrome.downloads) throw new Error("This build of the extension cannot download files.");
+    const id = await chrome.downloads.download({ url, conflictAction: "uniquify" });
+    return downloadInfo(await settleDownload(id, 20_000));
   },
 
   async browser_tab_list(_payload, { session }) {
     const tabs = await chrome.tabs.query({});
-    return tabs.map((tab) => tabInfo(tab, session));
+    const windows = await chrome.windows.getAll().catch(() => []);
+    const focused = windows.find((w) => w.focused)?.id;
+    return tabs.map((tab) => ({ ...tabInfo(tab, session), ...(tab.windowId === focused ? { focusedWindow: true } : {}) }));
   },
 
   async browser_tab_new({ url }, { session }) {
@@ -1436,6 +2395,15 @@ const handlers = {
   },
 
   async browser_tab_select({ tabId: target }, { session }) {
+    ensureOwnable(session, target);
+    const own = state.created.get(target) === session.id || state.owner.get(target) === session.id;
+    const handedBack = state.handoffs.get(target)?.sessionId === session.id;
+    if (!own && !state.pool.has(target) && !handedBack) {
+      throw new Error(
+        `Tab ${target} is the user's own tab. Agents work only in their own tabs and in tabs the user connected (Browser MCP Plus icon → Connect). Open a tab of your own with browser_tab_new.`,
+      );
+    }
+    if (handedBack) await runAgent(target, 0, "handoffClear", []).catch(() => {});
     await assign(session, target);
     return tabInfo(await chrome.tabs.get(target), session);
   },
@@ -1444,12 +2412,24 @@ const handlers = {
     target ??= session.tabId;
     if (target === null || target === undefined) throw new Error("You have no tab to close.");
     ensureOwnable(session, target);
-    if (target === session.tabId) unassign(session);
+    if (state.created.get(target) !== session.id) {
+      throw new Error(
+        `Tab ${target} is not one you opened, so it stays open. Agents close only their own tabs; use browser_tab_handoff to leave a tab to the user.`,
+      );
+    }
+    const wasCurrent = target === session.tabId;
+    if (wasCurrent) unassign(session);
     await chrome.tabs.remove(target);
-    // Carry on in another tab of this agent's, or a free connected tab;
-    // otherwise a tab is found (or opened) on the next request.
-    if (await takeFreeTab(session, target)) return tabInfo(await chrome.tabs.get(session.tabId), session);
+    // Closing its current tab, the agent carries on in another of its tabs or
+    // a free connected tab; otherwise a tab is found (or opened) on the next request.
+    if (wasCurrent && (await takeFreeTab(session, target))) return tabInfo(await chrome.tabs.get(session.tabId), session);
     return null;
+  },
+
+  async browser_tab_handoff({ tabId: target, note }, { session }) {
+    target ??= session.tabId;
+    if (target === null || target === undefined) throw new Error("You have no tab to hand over.");
+    return handoffTab(session, target, String(note ?? "").slice(0, 120) || "your turn");
   },
 
   sessions_update: updateSessions,
@@ -1460,6 +2440,9 @@ const handlers = {
 TABLESS.add("browser_tab_new");
 TABLESS.add("browser_tab_select");
 TABLESS.add("browser_tab_close");
+TABLESS.add("browser_tab_handoff");
+TABLESS.add("browser_downloads");
+TABLESS.add("browser_download");
 
 // ---------------------------------------------------------------------------
 // Popup and test hooks
@@ -1505,7 +2488,15 @@ async function status() {
       };
     });
   const here = active ? tabs.find((t) => t.id === active.id) : undefined;
+  const handoffs = [];
+  for (const [tabId, handoff] of state.handoffs) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) handoffs.push({ tabId, title: tab.title ?? "", note: handoff.note, agent: handoff.agent, seen: handoff.seen });
+  }
+  const activeHandoff = active ? state.handoffs.get(active.id) : undefined;
   return {
+    handoffs,
+    activeHandoff: activeHandoff ? { note: activeHandoff.note, agent: activeHandoff.agent } : null,
     port: state.port,
     version: chrome.runtime.getManifest().version,
     autoConnect: state.autoConnect,
@@ -1529,13 +2520,30 @@ async function focusTab(tabId) {
   return status();
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // The user acted on a page an agent handed over (from the page agent).
+  if (message?.cmd === "handoffSeen" && sender.tab) {
+    void handoffSeen(sender.tab.id, true);
+    return false;
+  }
+  // A page is about to show (or has closed) a JavaScript dialog (from the page hook).
+  if ((message?.cmd === "dialogOpening" || message?.cmd === "dialogClosed") && sender.tab && sender.frameId === 0) {
+    const tabId = sender.tab.id;
+    if (message.cmd === "dialogClosed") {
+      if (state.dialogs.get(tabId)?.unanswerable) state.dialogs.delete(tabId);
+    } else if (!state.attached.has(tabId)) {
+      state.dialogs.set(tabId, { type: String(message.type), message: String(message.message), unanswerable: true });
+      for (const waiter of dialogWaiters) if (waiter.tabId === tabId) waiter.notify();
+    }
+    return false;
+  }
   const actions = {
     status: () => status(),
     connect: () => connectTab(message.tabId).then(status),
     disconnect: () => (message.tabId ? disconnectTab(message.tabId) : disconnectAll()).then(status),
     disconnectAll: () => disconnectAll().then(status),
     keepTab: () => keepTab(message.tabId).then(status),
+    dismissHandoff: () => handoffSeen(message.tabId, true).then(status),
     resume: () => resume().then(status),
     focusTab: () => focusTab(message.tabId),
     setPort: () => setPort(message.port).then(status),
@@ -1550,6 +2558,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-globalThis.bmcp = { connectTab, disconnectTab, disconnectAll, keepTab, resume, setPort, setAutoConnect, status, checkOrphans };
+globalThis.bmcp = {
+  connectTab, disconnectTab, disconnectAll, keepTab, resume, setPort, setAutoConnect, status, checkOrphans, handoffSeen,
+  sweepDebugger,
+  /** Tabs this extension's debugger is attached to (Playwright attaches to every tab itself). */
+  debuggerTabs: () => [...state.attached],
+  /**
+   * What reloading the extension does to its state (session storage and memory
+   * gone, local storage kept), for tests: Playwright cannot reload an extension
+   * loaded from the command line.
+   */
+  async simulateReload() {
+    await chrome.storage.session.clear();
+    closeSocket();
+    for (const key of ["pool", "created", "sessions", "owner", "handoffs", "attached"]) state[key].clear();
+    state.groupId = null;
+    state.lostAt = null;
+    state.restored = false;
+    restoring = null;
+    await restore();
+  },
+};
 
 void restore();

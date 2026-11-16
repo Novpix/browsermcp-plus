@@ -124,7 +124,8 @@ describe("Browser MCP Plus extension end to end", () => {
     expect(text).toMatch(/- combobox "Country" \[ref=[^\]]+\]: United States/);
     expect(text).toMatch(/- checkbox "Accept terms"/);
     expect(text).toMatch(/- button "Document" \[file-input multiple\]/);
-    expect(text).toMatch(/- link "Second page" \[ref=[^\]]+\]:\n\s+- \/url: http/);
+    // Links to the page's own site are shown as a path.
+    expect(text).toMatch(/- link "Second page" \[ref=[^\]]+\]:\n\s+- \/url: \/page2\.html/);
     expect(text).toMatch(/- iframe "Inner frame"/);
     expect(text).toMatch(/- button "Frame button"/);
     expect(text).not.toContain("hidden-file");
@@ -142,17 +143,29 @@ describe("Browser MCP Plus extension end to end", () => {
     expect(await page.inputValue("#email")).toBe("new@example.com");
     await call("browser_type", { element: "Bio", ref: ref(snap, /textbox "Bio"/), text: "Hello", submit: false });
     expect(await page.inputValue("#bio")).toBe("Hello");
+    // Agents never type passwords: the user does (browser_tab_handoff).
     const password = await call("browser_type", {
       element: "Password",
       ref: ref(snap, /textbox "Password"/),
       text: "s3cret",
-      submit: true,
+    });
+    expect(password.isError).toBe(true);
+    expect(password.text).toContain("password field");
+    expect(password.text).toContain("browser_tab_handoff");
+    expect(await page.inputValue("#password")).toBe("");
+    // A password the user typed shows masked.
+    await page.fill("#password", "s3cret");
+    const submitted = await call("browser_type", {
+      element: "Bio",
+      ref: ref(snap, /textbox "Bio"/),
+      text: "Hello",
+      submit: false,
       snapshot: true,
     });
-    expect(await page.inputValue("#password")).toBe("s3cret");
+    expect(submitted.text).not.toContain("s3cret");
+    expect(submitted.text).toMatch(/textbox "Password" \[ref=[^\]]+\]: •+/);
+    await page.press("#email", "Enter");
     expect(await domText("#status")).toBe("Submitted new@example.com");
-    expect(password.text).not.toContain("s3cret: ");
-    expect(password.text).toMatch(/textbox "Password" \[ref=[^\]]+\]: •+/);
   });
 
   it("types into contenteditable", async () => {
@@ -271,8 +284,8 @@ describe("Browser MCP Plus extension end to end", () => {
 
   it("captures console logs and screenshots", async () => {
     const logs = await call("browser_get_console_logs");
-    expect(logs.text).toContain('"message":"counter clicked 1"');
-    expect(logs.text).toContain('"type":"warning"');
+    expect(logs.text).toContain("[log] counter clicked 1");
+    expect(logs.text).toContain("[warn]");
     const shot = await call("browser_screenshot");
     expect(shot.content[0].type).toBe("image");
     expect(Buffer.from(shot.content[0].data!, "base64").subarray(1, 4).toString()).toBe("PNG");
@@ -309,9 +322,12 @@ describe("Browser MCP Plus extension end to end", () => {
     const list = await call("browser_tab_list");
     const lines = list.text.split("\n");
     expect(lines).toHaveLength(2);
-    const connected = lines.find((l) => l.includes("(connected"))!;
+    const connected = lines.find((l) => l.includes("(yours, you work in it"))!;
     expect(connected).toContain("Second page");
-    const firstId = Number(/\[(\d+)\]/.exec(lines.find((l) => !l.includes("connected"))!)![1]);
+    // The tab the user connected is listed as theirs, usable by agents.
+    const userLine = lines.find((l) => l.includes("the user's, connected for agents"))!;
+    expect(userLine, list.text).toContain("Fixture form");
+    const firstId = Number(/\[(\d+)\]/.exec(userLine)![1]);
 
     const selected = await call("browser_tab_select", { tabId: firstId });
     expect(selected.text).toContain("- Page Title: Fixture form");
@@ -324,11 +340,11 @@ describe("Browser MCP Plus extension end to end", () => {
 
   it("keeps the working tab when a restricted page can't be controlled", async () => {
     const before = (await call("browser_tab_list")).text;
-    const workingId = Number(/\[(\d+)\][^\n]*\(connected/.exec(before)![1]);
+    const workingId = Number(/\[(\d+)\][^\n]*you work in it/.exec(before)![1]);
     const blocked = await call("browser_tab_new", { url: "chrome://version" });
     expect(blocked.isError).toBe(true);
     const list = (await call("browser_tab_list")).text;
-    expect(/\[(\d+)\][^\n]*\(connected/.exec(list)![1]).toBe(String(workingId));
+    expect(/\[(\d+)\][^\n]*you work in it/.exec(list)![1]).toBe(String(workingId));
     const restrictedId = Number(/\[(\d+)\][^\n]*chrome:\/\/version/.exec(list)![1]);
     // Tab commands still work and the snapshot still comes from the working tab.
     expect((await call("browser_tab_select", { tabId: workingId })).isError).toBeFalsy();
@@ -407,13 +423,15 @@ describe("Browser MCP Plus extension end to end", () => {
       expect(await status()).toBe("Search opened");
     });
 
-    it("reports tabs opened by a click", async () => {
+    it("moves to a tab the page opened, and back when it closes", async () => {
       const result = await call("browser_click", { element: "Help", ref: ref(snap, /link "Open help in new tab"/) });
-      expect(result.text).toMatch(/New tab opened: \[(\d+)\]/);
-      const newId = Number(/New tab opened: \[(\d+)\]/.exec(result.text)![1]);
-      // Still connected to the original tab.
-      expect(result.text).toContain("- Page Title: Fixture actions");
-      await call("browser_tab_close", { tabId: newId });
+      const moved = /you now work in it: \[(\d+)\] Second page/.exec(result.text);
+      expect(moved, result.text).not.toBeNull();
+      expect((await snapshot())).toContain("- Page Title: Second page");
+      const closed = await call("browser_tab_close", {});
+      expect(closed.text).toContain("Closed tab; now connected to tab");
+      expect((await call("browser_tab_list")).text).not.toContain(`[${moved![1]}]`);
+      expect(await snapshot()).toContain("Fixture actions");
     });
 
     it("does not report a delayed navigation as a failed click", async () => {
@@ -479,7 +497,7 @@ describe("Browser MCP Plus extension end to end", () => {
       expect(read.isError).toBe(true);
       expect(read.text).toContain("Navigate to a website first");
       const tabs = (await call("browser_tab_list")).text;
-      const blankId = Number(/\[(\d+)\][^\n]*\(connected/.exec(tabs)![1]);
+      const blankId = Number(/\[(\d+)\][^\n]*you work in it/.exec(tabs)![1]);
       // Closing the connected tab hands the session to another tab instead of dropping it.
       const closed = await call("browser_tab_close", { tabId: blankId });
       expect(closed.text).toContain(`Closed tab ${blankId}; now connected to tab`);

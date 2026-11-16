@@ -15,7 +15,8 @@ type ElementRef = { element: string; ref: string };
 export type ExtensionMessages = {
   getUrl: { payload: undefined; result: string };
   getTitle: { payload: undefined; result: string };
-  browser_snapshot: { payload: Record<string, never>; result: string };
+  /** `expect`: text the caller looks for; a page still loading gets a moment to show it (Plus extension). */
+  browser_snapshot: { payload: { expect?: string }; result: string };
   // Page actions: the Plus extension answers with an ActionReport, the
   // original extension with nothing.
   browser_navigate: { payload: { url: string }; result: ActionResult };
@@ -42,11 +43,11 @@ export type ExtensionMessages = {
     };
     result: ActionResult;
   };
-  /** Base64 encoded PNG. */
-  browser_screenshot: { payload: Record<string, never>; result: string };
+  /** Base64 encoded PNG. `ref` and `fullPage` need the Plus extension (capability element_screenshot). */
+  browser_screenshot: { payload: { ref?: string; fullPage?: boolean }; result: string };
   browser_get_console_logs: {
     payload: Record<string, never>;
-    result: unknown[];
+    result: ConsoleEntry[];
   };
 
   // Browser MCP Plus extension only (announced through `hello` capabilities).
@@ -67,6 +68,17 @@ export type ExtensionMessages = {
   browser_tab_new: { payload: { url?: string }; result: TabInfo };
   browser_tab_select: { payload: { tabId: number }; result: TabInfo };
   browser_tab_close: { payload: { tabId?: number }; result: TabInfo | null };
+  /** Leaves a tab to the user (it stays open, out of the agents' group) with a note. */
+  browser_tab_handoff: { payload: { tabId?: number; note: string }; result: TabInfo };
+  /** The page's readable text (or one element's), frames included. */
+  browser_get_text: {
+    payload: { ref?: string; selector?: string; links?: boolean };
+    result: { text: string; url: string; title: string };
+  };
+  /** A file the page shows or links to, fetched with the browser's logins. */
+  browser_get_file: { payload: { url?: string; ref?: string }; result: FileResult };
+  browser_downloads: { payload: { limit?: number }; result: DownloadInfo[] };
+  browser_download: { payload: { url: string }; result: DownloadInfo };
   /**
    * Tells the extension which Chrome profile it runs in (it remembers it), and
    * hands it the tab opened for an agent while opening that profile.
@@ -91,6 +103,42 @@ export type ActionReport = {
   newTabs?: TabInfo[];
   /** Action-specific outcome, e.g. a field's value after typing. */
   value?: unknown;
+  /** The page opened a tab and the agent now works in it. */
+  switchedTo?: TabInfo;
+  /** Downloads the action started. */
+  downloads?: { id: number; url: string; filename: string }[];
+  /**
+   * What changed on the page since the agent's last snapshot ("+ added",
+   * "~ changed", "- removed" snapshot lines); empty: nothing visible changed.
+   */
+  changes?: string[];
+  /** Changes left out of `changes`. */
+  moreChanges?: number;
+};
+
+export type ConsoleEntry = { type: string; timestamp?: number; message?: string };
+
+export type FileResult = {
+  url: string;
+  base64: string;
+  mimeType: string;
+  size: number;
+  /** The Content-Disposition header, which may name the file. */
+  disposition?: string;
+};
+
+export type DownloadInfo = {
+  id: number;
+  url: string;
+  /** Where the file is (being) saved. */
+  path: string;
+  state: "in_progress" | "interrupted" | "complete";
+  bytes: number;
+  totalBytes: number;
+  mimeType: string;
+  startTime: string;
+  error?: string;
+  danger?: string;
 };
 
 export type ActionResult = ActionReport | undefined;
@@ -121,6 +169,18 @@ export type TabInfo = {
   connected: boolean;
   /** Name of the other agent working in this tab, if any. */
   agent?: string;
+  /**
+   * Whose tab it is: you (you opened or work in it), another agent, the user
+   * (connected for agents, or not), or the user after an agent handed it over.
+   */
+  owner?: "you" | "agent" | "user" | "user-connected" | "handed-off";
+  /** The note of a handed-over tab, and who left it. */
+  note?: string;
+  handedOffBy?: string;
+  /** In the agents' tab group. */
+  grouped?: boolean;
+  /** In the window the user is using. */
+  focusedWindow?: boolean;
 };
 
 /** An agent session: one MCP server process, usually one Claude Code session. */
@@ -146,6 +206,11 @@ export const PLUS_MESSAGES = new Set<MessageType>([
   "browser_fill_form",
   "sessions_update",
   "profile_set",
+  "browser_get_text",
+  "browser_get_file",
+  "browser_downloads",
+  "browser_download",
+  "browser_tab_handoff",
 ]);
 
 /** Sent by the Browser MCP Plus extension right after connecting. */

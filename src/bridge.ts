@@ -35,6 +35,7 @@ import {
   chromeLauncher,
   ChromeProfiles,
   defaultUserDataDir,
+  describeProfile,
   findProfile,
   identifyProfile,
   type ChromeProfile,
@@ -274,6 +275,25 @@ export class ExtensionBridge {
     // A joined session learns the new mapping from the hub's next status.
     await this.waitUntil(() => this.reachable().some((b) => b.profile === profile.directory), 3_000);
     return { profile, opened: true };
+  }
+
+  /** A channel to every connected browser (profile), labelled with the profile's name. */
+  async everyBrowser(timeoutMs: number): Promise<{ label: string; channel: Channel }[]> {
+    await this.getChannel(timeoutMs);
+    const profiles = await this.profiles.list();
+    const out: { label: string; channel: Channel }[] = [];
+    for (const browser of this.reachable()) {
+      const channel = this.channelTo(browser);
+      if (!channel) continue;
+      const profile = profiles.find((p) => p.directory === browser.profile);
+      const label = profile
+        ? `Chrome profile ${describeProfile(profile)}`
+        : browser.profile
+          ? `Chrome profile ${browser.profile}`
+          : "Chrome profile (not identified)";
+      out.push({ label, channel });
+    }
+    return out;
   }
 
   /** The Chrome profiles and which of them are connected, for browser_profiles. */

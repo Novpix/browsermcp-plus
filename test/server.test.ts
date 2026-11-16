@@ -74,6 +74,11 @@ describe("MCP server", () => {
         "browser_tab_close",
         "browser_profiles",
         "browser_profile_select",
+        "browser_get_text",
+        "browser_get_file",
+        "browser_downloads",
+        "browser_download",
+        "browser_tab_handoff",
       ].sort(),
     );
     for (const tool of tools) {
@@ -201,7 +206,20 @@ describe("MCP server", () => {
     const result = await call("browser_snapshot");
     expect(result.text).toContain("- text: line 0");
     expect(result.text).not.toContain("line 9");
-    expect(result.text).toMatch(/truncated \(\d+ characters\)\. Use browser_find/);
+    const more = /# … (\d+) more characters\. Call browser_snapshot with offset: (\d+) to continue/.exec(result.text);
+    expect(more, result.text).not.toBeNull();
+
+    // The offset continues at the next line, and the last page says nothing more.
+    const lastShown = Math.max(...[...result.text.matchAll(/line (\d+)/g)].map((m) => Number(m[1])));
+    const next = await call("browser_snapshot", { offset: Number(more![2]) });
+    expect(next.text).toContain(`- text: line ${lastShown + 1}`);
+    expect(next.text).not.toMatch(new RegExp(`line ${lastShown}$`, "m"));
+    let shown = next.text;
+    for (let i = 0; i < 10 && /offset: (\d+)/.test(shown); i++) {
+      shown = (await call("browser_snapshot", { offset: Number(/offset: (\d+)/.exec(shown)![1]) })).text;
+    }
+    expect(shown).toContain("line 9");
+    expect(shown).not.toContain("more characters");
   });
 
   it("reload re-navigates to the current URL", async () => {
@@ -257,9 +275,16 @@ describe("MCP server", () => {
 
   it("formats console logs and handles an empty log", async () => {
     const { call, extension } = await setup();
-    expect((await call("browser_get_console_logs")).text).toBe('{"type":"log","message":"hello"}');
+    expect((await call("browser_get_console_logs")).text).toBe("[log] hello");
+    extension.handlers.browser_get_console_logs = () => [
+      { type: "error", message: "Uncaught TypeError: x is undefined" },
+      { type: "network", message: "GET https://api.example/x → HTTP 500 (xmlhttprequest)" },
+    ];
+    expect((await call("browser_get_console_logs")).text).toBe(
+      "[error] Uncaught TypeError: x is undefined\n[network] GET https://api.example/x → HTTP 500 (xmlhttprequest)",
+    );
     extension.handlers.browser_get_console_logs = () => [];
-    expect((await call("browser_get_console_logs")).text).toBe("No console logs captured.");
+    expect((await call("browser_get_console_logs")).text).toBe("No console messages or failed requests.");
   });
 
   it("reports a missing extension as a tool error, not a crash", async () => {

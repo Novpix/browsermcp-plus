@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+  <head><title>Inner</title></head>
+  <body style="margin: 8px">
+    <h2>Inside the other site</h2>
+    <p>This paragraph lives in a frame served from another site. It is long on purpose, so that reading it in full shows that nothing is clipped at two hundred characters as the snapshot does: the end of it says FRAME-TEXT-END.</p>
+    <label>Name on card <input id="card-name" /></label>
+    <button onclick="document.getElementById('frame-status').textContent = 'Frame clicked'">Frame action</button>
+    <div id="frame-status">Frame idle</div>
+    <iframe title="Nested site" src="{{SAME_ORIGIN}}/frame-nested.html" style="width: 300px; height: 90px; border: 0"></iframe>
+  </body>
+</html>

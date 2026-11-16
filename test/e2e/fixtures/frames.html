@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head><title>Frames page</title></head>
+  <body style="margin: 0; background: #fff">
+    <h1>Frames page</h1>
+    <p id="top-status">Top idle</p>
+    <iframe title="Other site" src="{{OTHER_ORIGIN}}/frame-inner.html" style="width: 520px; height: 360px; border: 2px solid #ccc; margin-top: 40px"></iframe>
+    <iframe title="Hidden other site" src="{{OTHER_ORIGIN}}/frame-hidden.html" style="display: none"></iframe>
+    <closed-widget></closed-widget>
+    <script>
+      customElements.define(
+        "closed-widget",
+        class extends HTMLElement {
+          constructor() {
+            super();
+            const root = this.attachShadow({ mode: "closed" });
+            const button = document.createElement("button");
+            button.textContent = "Closed shadow button";
+            button.onclick = () => (document.getElementById("top-status").textContent = "Closed shadow clicked");
+            root.append(button);
+          }
+        },
+      );
+    </script>
+  </body>
+</html>

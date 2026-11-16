@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head><title>Controlled input</title></head>
+  <body>
+    <label>Controlled <input id="controlled" /></label>
+    <div id="state">state:</div>
+    <script>
+      // Like a React controlled input: the value comes from state, which only
+      // the input event updates; every render puts the state's value back.
+      let state = "";
+      const input = document.getElementById("controlled");
+      input.addEventListener("input", (event) => {
+        state = event.target.value;
+        render();
+      });
+      function render() {
+        document.getElementById("state").textContent = "state: " + state;
+        if (input.value !== state) input.value = state;
+      }
+      setInterval(render, 50);
+    </script>
+  </body>
+</html>

@@ -135,11 +135,14 @@ describe("several agents in one browser", () => {
     expect(status.tabs.map((t) => t.agent).sort()).toEqual(["alpha", "beta"]);
   });
 
-  it("does not put the tabs it opens in a tab group", async () => {
+  it("puts agent tabs in one \"AI\" group, never the user's tab", async () => {
     const [betaTab] = await agentTabs("beta");
     const tab = await worker.evaluate((id) => chrome.tabs.get(id), betaTab);
-    expect(tab.groupId).toBe(-1);
-    expect(await worker.evaluate(() => typeof chrome.tabGroups)).toBe("undefined");
+    expect(tab.groupId).not.toBe(-1);
+    const groups = await worker.evaluate(() => chrome.tabGroups.query({}));
+    expect(groups.map((g: { title: string }) => g.title)).toEqual(["AI"]);
+    const user = await worker.evaluate((id) => chrome.tabs.get(id), userTab);
+    expect(user.groupId).toBe(-1);
   });
 
   it("each agent sees and drives only its own tab, in parallel", async () => {
@@ -161,9 +164,9 @@ describe("several agents in one browser", () => {
 
   it("shows other agents' tabs and refuses to take them", async () => {
     const list = await call("alpha", "browser_tab_list");
-    const betaLine = list.text.split("\n").find((l) => l.includes('used by agent "beta"'));
+    const betaLine = list.text.split("\n").find((l) => l.includes('agent "beta"\'s — hands off'));
     expect(betaLine, list.text).toBeDefined();
-    expect(list.text).toMatch(/Fixture form .*\(connected/);
+    expect(list.text).toMatch(/Fixture form .*\(yours, you work in it/);
     const betaTab = Number(/\[(\d+)\]/.exec(betaLine!)![1]);
 
     const taken = await call("alpha", "browser_tab_select", { tabId: betaTab });
@@ -179,8 +182,8 @@ describe("several agents in one browser", () => {
     const link = /link "Open help in new tab" \[ref=([^\]]+)\]/.exec(nav.text)![1];
     const click = await call("beta", "browser_click", { element: "help link", ref: link });
     expect(click.isError, click.text).toBeFalsy();
-    // Reported even though the agent works in a background tab.
-    expect(click.text).toMatch(/New tab opened: \[\d+\]/);
+    // Noticed even though the agent works in a background tab: it moves there.
+    expect(click.text).toMatch(/you now work in it: \[\d+\]/);
     await waitFor(async () => (await agentTabs("beta")).length === 2);
     const betaTabs = await agentTabs("beta");
 

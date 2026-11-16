@@ -111,25 +111,78 @@ async function tabResult(context: Parameters<typeof snapshotResult>[0], status: 
   }
 }
 
-function formatTab(tab: TabInfo): string {
-  const flags = [
-    tab.connected && "connected",
-    tab.agent && `used by agent ${JSON.stringify(tab.agent)}`,
-    tab.active && "active",
-  ].filter(Boolean);
+/** Whose tab it is and what the agent may do with it. */
+function ownerLabel(tab: TabInfo): string {
+  switch (tab.owner) {
+    case "you":
+      return tab.connected ? "yours, you work in it" : "yours";
+    case "agent":
+      return `agent ${JSON.stringify(tab.agent ?? "?")}'s — hands off`;
+    case "user-connected":
+      return "the user's, connected for agents — you may use it";
+    case "handed-off":
+      return `handed to the user${tab.note ? `: ${JSON.stringify(tab.note)}` : ""} — waiting for them`;
+    case "user":
+      return "the user's — hands off";
+    default:
+      // An extension without owners (older Browser MCP Plus).
+      return [tab.connected && "connected", tab.agent && `used by agent ${JSON.stringify(tab.agent)}`].filter(Boolean).join(", ");
+  }
+}
+
+export function formatTab(tab: TabInfo): string {
+  const flags = [ownerLabel(tab), tab.active && "active", tab.grouped && "in the AI group"].filter(Boolean);
   const suffix = flags.length ? ` (${flags.join(", ")})` : "";
   return `- [${tab.id}] ${tab.title || "(untitled)"} — ${tab.url}${suffix}`;
+}
+
+/** Tabs grouped by window, the window the user is in first. */
+export function formatTabs(tabs: TabInfo[]): string {
+  if (!tabs.length) return "No tabs open.";
+  const windows = new Map<number, TabInfo[]>();
+  for (const tab of tabs) windows.set(tab.windowId, [...(windows.get(tab.windowId) ?? []), tab]);
+  if (windows.size === 1) return tabs.map(formatTab).join("\n");
+  const order = [...windows.entries()].sort(([, a], [, b]) => Number(!!b[0].focusedWindow) - Number(!!a[0].focusedWindow));
+  return order
+    .map(([id, list], i) =>
+      [`Window ${i + 1}${list[0].focusedWindow ? " (the user's current window)" : ""} [${id}]:`, ...list.map(formatTab)].join("\n"),
+    )
+    .join("\n");
 }
 
 export const tabList = defineTool({
   name: "browser_tab_list",
   description:
-    "List the open tabs of your Chrome profile. Your tab is marked connected; tabs of other agents are marked and cannot be selected.",
-  inputSchema: z.object({}),
+    "List the tabs of your Chrome profile by window, with whose each is: yours, another agent's, the user's (you may use those the user connected), or handed to the user. allProfiles lists every connected profile.",
+  inputSchema: z.object({
+    allProfiles: z.boolean().optional().describe("List the tabs of every connected Chrome profile"),
+  }),
   annotations: READ_ONLY,
-  handle: async (context) => {
-    const tabs = await context.send("browser_tab_list", {});
-    return text(tabs.map(formatTab).join("\n") || "No tabs open.");
+  handle: async (context, { allProfiles }) => {
+    if (!allProfiles) return text(formatTabs(await context.send("browser_tab_list", {})));
+    const sections: string[] = [];
+    for (const { label, channel } of await context.bridge.everyBrowser(context.connectWaitMs)) {
+      const tabs = await channel.request("browser_tab_list", {}, context.requestTimeoutMs).catch((error: Error) => error);
+      sections.push(`## ${label}`, tabs instanceof Error ? `(could not list: ${tabs.message})` : formatTabs(tabs), "");
+    }
+    return text(sections.join("\n").trim());
+  },
+});
+
+export const tabHandoff = defineTool({
+  name: "browser_tab_handoff",
+  description:
+    "Leave a tab to the user when they must act (sign in, solve a captcha, approve, look at a result). The tab stays open after you finish, leaves the AI group, shows your note and blinks in the tab strip until the user looks. Without a tabId, your current tab. browser_tab_select takes it back later.",
+  inputSchema: z.object({
+    note: z.string().min(1).max(120).describe('What the user should do, short (e.g. "sign-in needed")'),
+    tabId: z.number().int().optional().describe("Tab id from browser_tab_list (default: your current tab)"),
+  }),
+  annotations: NAVIGATION,
+  handle: async (context, { note, tabId }) => {
+    const tab = await context.send("browser_tab_handoff", { note, tabId });
+    return text(
+      `Handed tab ${tab.id} (${tab.title || tab.url}) to the user: ${JSON.stringify(note)}. It stays open after you finish and blinks until the user looks at it. Tell the user what to do there; browser_tab_select takes it back.`,
+    );
   },
 });
 

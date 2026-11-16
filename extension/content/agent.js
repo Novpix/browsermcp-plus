@@ -1,20 +1,47 @@
-// Page agent injected into the connected tab's isolated world.
+// Page agent injected into the isolated world of every frame of the tabs
+// agents use.
 //
 // It builds the accessibility snapshot the model works from, owns the
-// ref -> element map behind it, and performs the DOM-level parts of actions.
+// ref -> element map behind it, performs the DOM-level parts of actions,
+// extracts readable text and shows the "an agent is working here" overlay.
 // Pointer and keyboard input itself is dispatched by the background worker
 // through the debugger API so pages receive trusted events.
+//
+// Frames: a frame's snapshot includes the same-origin frames inside it; a
+// cross-origin frame runs its own copy of this agent and shows up as a
+// placeholder (`- <<frame:TOKEN>>`) the background fills with that frame's
+// snapshot. Which <iframe> holds which frame is learnt with a postMessage
+// handshake: the parent says hello, the child answers with its token.
 (() => {
   if (globalThis.__bmcp) return;
 
   const MAX_TEXT = 200;
   const MAX_NAME = 120;
+  const IS_TOP = window === window.top;
+  /** This agent's id, which its parent frame learns in the handshake. */
+  const TOKEN = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+  /** Same-origin frames are part of their parent's snapshot. */
+  const SAME_ORIGIN_PARENT =
+    !IS_TOP &&
+    (() => {
+      try {
+        return !!window.parent.document;
+      } catch {
+        return false;
+      }
+    })();
 
   // Refs are stable: an element keeps its ref across snapshots for as long as
   // it stays in the document, so refs from earlier results remain usable.
+  // Refs of subframes carry the frame ("f12e3"), set by the background.
+  let prefix = "";
   let counter = 0;
   const refs = new Map(); // ref -> WeakRef<Element>
   const refOf = new WeakMap(); // Element -> ref
+
+  function setPrefix(value) {
+    if (!prefix && !counter) prefix = value;
+  }
 
   const SKIPPED_TAGS = new Set([
     "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "META", "LINK", "BASE", "TITLE",
@@ -30,6 +57,11 @@
     TD: "cell", TEXTAREA: "textbox", TFOOT: "rowgroup", TH: "columnheader", THEAD: "rowgroup",
     TR: "row", UL: "list",
   };
+
+  /** Structure that carries no information of its own: its content is listed in its place. */
+  const FLATTENED_ROLES = new Set(["rowgroup", "generic", "none", "presentation"]);
+  /** Roles listed without a ref. */
+  const UNREFERENCED_ROLES = new Set();
 
   /** Roles whose accessible name comes from their content. */
   const NAME_FROM_CONTENT = new Set([
@@ -151,28 +183,57 @@
     );
   }
 
-  function isHidden(el, style) {
-    if (el.hidden || el.getAttribute("aria-hidden") === "true") return true;
-    if (style.display === "none") return true;
-    if (style.visibility === "hidden" || style.visibility === "collapse") return true;
+  /**
+   * Hidden from the user: display:none, visibility:hidden, aria-hidden. Uses
+   * the browser's own checkVisibility, much cheaper than getComputedStyle
+   * per element; display:contents boxes have no box of their own but their
+   * children may well be visible.
+   */
+  function isHidden(el) {
+    if (el === overlay?.host) return true;
+    if (el.getAttribute("aria-hidden") === "true") return true;
     if (el.tagName === "INPUT" && el.type === "hidden") return true;
-    return false;
+    if (el.checkVisibility) {
+      if (el.checkVisibility({ visibilityProperty: true })) return false;
+      const style = el.ownerDocument.defaultView.getComputedStyle(el);
+      return style.display !== "contents";
+    }
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    return el.hidden || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse";
+  }
+
+  /** Open and closed shadow roots (content scripts may read closed ones). */
+  function shadowOf(node) {
+    if (node.shadowRoot) return node.shadowRoot;
+    if (!node.localName?.includes("-")) return null;
+    try {
+      return chrome.dom?.openOrClosedShadowRoot(node) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The document inside a frame element, if this frame may read it. */
+  function frameDocument(frame) {
+    try {
+      return frame.contentDocument;
+    } catch {
+      return null;
+    }
   }
 
   function childNodesOf(node) {
-    if (node.shadowRoot) return [...node.shadowRoot.childNodes];
+    const shadow = shadowOf(node);
+    if (shadow) return [...shadow.childNodes];
     if (node.tagName === "SLOT") {
       const assigned = node.assignedNodes({ flatten: true });
       if (assigned.length) return assigned;
     }
     if (node.tagName === "IFRAME" || node.tagName === "FRAME") {
-      let doc = null;
-      try {
-        doc = node.contentDocument;
-      } catch {
-        doc = null;
-      }
-      return doc?.body ? [doc.body] : [];
+      const doc = frameDocument(node);
+      // A frameset document's body is the <frameset>.
+      const root = doc?.body ?? doc?.documentElement;
+      return root ? [root] : [];
     }
     return [...node.childNodes];
   }
@@ -229,7 +290,7 @@
   function newRef(el) {
     let ref = refOf.get(el);
     if (!ref) {
-      ref = `e${++counter}`;
+      ref = `${prefix}e${++counter}`;
       refOf.set(el, ref);
       refs.set(ref, new WeakRef(el));
     }
@@ -252,41 +313,34 @@
     if (node.nodeType !== Node.ELEMENT_NODE) return [];
     const el = node;
     if (SKIPPED_TAGS.has(el.tagName)) return [];
-    const style = el.ownerDocument.defaultView.getComputedStyle(el);
-    if (isHidden(el, style)) return [];
+    if (isHidden(el)) return [];
 
     const role = roleOf(el);
     if (role === "iframe") {
-      let sameOrigin = true;
-      try {
-        sameOrigin = !!el.contentDocument;
-      } catch {
-        sameOrigin = false;
+      const item = { role, name: nameOf(el, role), attrs: [], ref: newRef(el) };
+      if (frameDocument(el)) {
+        item.children = merge(childNodesOf(el).flatMap(build));
+      } else {
+        // Another origin: its own agent fills this in.
+        crossOriginFrames.add(el);
+        item.children = [{ frame: frameTokens.get(el) ?? "?" }];
       }
-      const item = { role, name: nameOf(el, role), attrs: sameOrigin ? [] : ["cross-origin"], ref: newRef(el) };
-      item.children = sameOrigin ? merge(childNodesOf(el).flatMap(build)) : [];
       return [item];
     }
 
-    if (!role) return childNodesOf(el).flatMap(build);
+    if (!role || FLATTENED_ROLES.has(role)) return childNodesOf(el).flatMap(build);
 
     const item = {
       role,
       name: nameOf(el, role),
       attrs: stateOf(el, role),
-      ref: newRef(el),
+      ref: UNREFERENCED_ROLES.has(role) ? null : newRef(el),
       value: valueOf(el, role),
       children: [],
     };
     if (role === "link") {
       const href = el.getAttribute("href");
-      if (href) {
-        try {
-          item.url = new URL(href, el.ownerDocument.baseURI).href;
-        } catch {
-          item.url = href;
-        }
-      }
+      if (href) item.url = shortUrl(href, el.ownerDocument.baseURI);
     }
     if (el.tagName === "SELECT") {
       item.children = [...el.options].map((option) => ({
@@ -300,6 +354,16 @@
       item.children = merge(childNodesOf(el).flatMap(build));
     }
     return [item];
+  }
+
+  /** Links to this page's origin are shown as a path: shorter, and just as usable. */
+  function shortUrl(href, base) {
+    try {
+      const url = new URL(href, base);
+      return url.origin === location.origin && url.protocol.startsWith("http") ? url.pathname + url.search + url.hash : url.href;
+    } catch {
+      return href;
+    }
   }
 
   /** Joins adjacent text items so inline markup does not split sentences. */
@@ -330,10 +394,14 @@
         lines.push(`${pad}- text: ${scalar(item.text)}`);
         continue;
       }
+      if (item.frame !== undefined) {
+        lines.push(`${pad}- <<frame:${item.frame}>>`);
+        continue;
+      }
       let line = `${pad}- ${item.role}`;
       if (item.name) line += ` ${JSON.stringify(item.name)}`;
       for (const attr of item.attrs) line += ` [${attr}]`;
-      line += ` [ref=${item.ref}]`;
+      if (item.ref) line += ` [ref=${item.ref}]`;
       const children = item.children || [];
       const onlyText = children.length === 1 && children[0].text !== undefined && !item.url;
       if (item.value != null && item.value !== "") {
@@ -351,13 +419,168 @@
     }
   }
 
+  /** The last snapshot handed out, and the DOM's mutation count then: the baseline for changes(). */
+  let lastSnapshot = null;
+
   function snapshot() {
     pruneRefs();
+    crossOriginFrames.clear();
     const root = document.body || document.documentElement;
-    if (!root) return "";
     const lines = [];
-    render(merge(build(root)), 0, lines);
-    return lines.join("\n");
+    if (root) render(merge(build(root)), 0, lines);
+    const text = lines.join("\n");
+    lastSnapshot = { text, mutations: mutationCount };
+    return text;
+  }
+
+  /**
+   * What changed since the last snapshot, as "+ added", "~ changed" and
+   * "- removed" lines (elements matched by their stable refs, text by
+   * content); null without a snapshot to compare with. Untouched DOM is
+   * answered without building a snapshot.
+   */
+  function changes(max = 40) {
+    if (!lastSnapshot) return null;
+    if (mutationCount === lastSnapshot.mutations) return { lines: [], more: 0 };
+    const before = lastSnapshot.text;
+    return diffSnapshots(before, snapshot(), max);
+  }
+
+  function diffSnapshots(before, after, max) {
+    const index = (text) => {
+      const byRef = new Map();
+      const texts = new Map();
+      for (const raw of text.split("\n")) {
+        const line = raw.trim();
+        if (!line || line.startsWith("- /url:")) continue;
+        const ref = /\[ref=([^\]]+)\]/.exec(line)?.[1];
+        if (ref) byRef.set(ref, line);
+        else texts.set(line, (texts.get(line) ?? 0) + 1);
+      }
+      return { byRef, texts };
+    };
+    const old = index(before);
+    const now = index(after);
+    const lines = [];
+    for (const [ref, line] of now.byRef) {
+      const was = old.byRef.get(ref);
+      if (was === undefined) lines.push(`+ ${line.slice(2)}`);
+      else if (was !== line) lines.push(`~ ${line.slice(2)}`);
+    }
+    for (const [line, count] of now.texts) if (count > (old.texts.get(line) ?? 0)) lines.push(`+ ${line.slice(2)}`);
+    for (const [ref, line] of old.byRef) if (!now.byRef.has(ref)) lines.push(`- ${line.slice(2)}`);
+    for (const [line, count] of old.texts) if (count > (now.texts.get(line) ?? 0)) lines.push(`- ${line.slice(2)}`);
+    return { lines: lines.slice(0, max), more: Math.max(0, lines.length - max) };
+  }
+
+  /** What the background needs to stitch this frame into its parent's snapshot. */
+  function frameSnapshot() {
+    if (SAME_ORIGIN_PARENT) return { token: TOKEN, inlined: true };
+    if (!IS_TOP && (window.innerWidth === 0 || window.innerHeight === 0)) return { token: TOKEN, text: "" };
+    return { token: TOKEN, text: snapshot() };
+  }
+
+  // --- Frame handshake ------------------------------------------------------
+
+  /** Cross-origin frame elements seen in the last snapshot (some live in shadow roots). */
+  const crossOriginFrames = new Set();
+  const frameTokens = new WeakMap(); // frame element -> child agent's token
+  const tokenFrames = new Map(); // token -> WeakRef<frame element>
+  const asked = new Map(); // child WindowProxy -> frame element, while waiting for an answer
+
+  addEventListener(
+    "message",
+    (event) => {
+      const data = event.data;
+      if (!data || typeof data !== "object" || typeof data.__bmcp !== "string") return;
+      if (data.__bmcp === "hello" && event.source && event.source !== window) {
+        try {
+          event.source.postMessage({ __bmcp: "child", token: TOKEN, to: data.from }, "*");
+        } catch {
+          // the asking window is gone
+        }
+      } else if (data.__bmcp === "child" && data.to === TOKEN) {
+        const frame = asked.get(event.source);
+        if (!frame) return;
+        asked.delete(event.source);
+        frameTokens.set(frame, data.token);
+        tokenFrames.set(data.token, new WeakRef(frame));
+      }
+    },
+    true,
+  );
+
+  /** Every cross-origin frame element in this document and the same-origin frames inside it. */
+  function allCrossOriginFrames() {
+    const found = new Set(crossOriginFrames);
+    const visit = (doc) => {
+      for (const frame of doc.querySelectorAll("iframe, frame")) {
+        const inner = frameDocument(frame);
+        if (inner) visit(inner);
+        else found.add(frame);
+      }
+    };
+    visit(document);
+    return [...found].filter((f) => f.isConnected);
+  }
+
+  /** Says hello to the cross-origin frames whose agent is not known yet. Returns how many. */
+  function probe() {
+    let asking = 0;
+    for (const frame of allCrossOriginFrames()) {
+      const win = frame.contentWindow;
+      const token = frameTokens.get(frame);
+      if (!win || (token && tokenFrames.get(token)?.deref() === frame && !asked.has(win))) continue;
+      asked.set(win, frame);
+      win.postMessage({ __bmcp: "hello", from: TOKEN }, "*");
+      asking++;
+    }
+    return asking;
+  }
+
+  /** Offset of a child frame's viewport in this frame's viewport, optionally scrolling it into view. */
+  function frameOffset(token, scroll = false) {
+    const frame = tokenFrames.get(token)?.deref();
+    if (!frame || !frame.isConnected) {
+      throw new Error("The frame this element is in is no longer on the page. Take a new snapshot.");
+    }
+    if (scroll) frame.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+    const rect = frame.getBoundingClientRect();
+    const style = frame.ownerDocument.defaultView.getComputedStyle(frame);
+    const point = toTopViewport(
+      frame,
+      rect.left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft),
+      rect.top + parseFloat(style.borderTopWidth) + parseFloat(style.paddingTop),
+    );
+    return { ...point, width: frame.clientWidth, height: frame.clientHeight };
+  }
+
+  /** What would receive a click at (x, y) instead of the child frame, or null. */
+  function frameBlocker(token, x, y) {
+    const frame = tokenFrames.get(token)?.deref();
+    if (!frame) return null;
+    const hit = deepHit(document, x, y);
+    return !hit || hit === frame || composedContains(frame, hit) ? null : describeBlocker(hit);
+  }
+
+  /** The element at (x, y), looking into shadow roots and same-origin frames. */
+  function deepHit(doc, x, y) {
+    let hit = deepElementFromPoint(doc, x, y);
+    while (hit && (hit.tagName === "IFRAME" || hit.tagName === "FRAME")) {
+      const inner = frameDocument(hit);
+      if (!inner) break;
+      const rect = hit.getBoundingClientRect();
+      x -= rect.left + hit.clientLeft;
+      y -= rect.top + hit.clientTop;
+      const inside = deepElementFromPoint(inner, x, y);
+      if (!inside) break;
+      hit = inside;
+    }
+    return hit;
+  }
+
+  function info() {
+    return { token: TOKEN, inlined: SAME_ORIGIN_PARENT, url: location.href };
   }
 
   function element(ref) {
@@ -472,9 +695,20 @@
     if (rect.width === 0 && rect.height === 0) {
       throw new Error(`Element "${ref}" has no visible size and cannot be interacted with.`);
     }
-    let x = rect.left + rect.width / 2;
-    let y = rect.top + rect.height / 2;
-    // Translate through same-origin iframes up to the top-level viewport.
+    return toTopViewport(el, rect.left + rect.width / 2, rect.top + rect.height / 2);
+  }
+
+  /** The element's box in this frame's viewport (for element screenshots). */
+  function boxIn(ref) {
+    const el = element(ref);
+    el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) throw new Error(`Element "${ref}" has no visible size.`);
+    return { ...toTopViewport(el, rect.left, rect.top), width: rect.width, height: rect.height };
+  }
+
+  /** Translates a point in `el`'s document through same-origin iframes to this frame's viewport. */
+  function toTopViewport(el, x, y) {
     let win = el.ownerDocument.defaultView;
     while (win && win !== window && win.frameElement) {
       const frame = win.frameElement;
@@ -493,6 +727,11 @@
   /** How a field should be edited: "text" (focus + type), "direct" (set value) or an error. */
   function editKind(ref) {
     const el = element(ref);
+    if (isPassword(el)) {
+      throw new Error(
+        `Element "${ref}" is a password field. Agents never type or read passwords: hand the tab to the user with browser_tab_handoff (e.g. note "sign-in needed") and let them enter it.`,
+      );
+    }
     if (isDisabled(el)) throw new Error(`Element "${ref}" is disabled.`);
     if (el.readOnly) throw new Error(`Element "${ref}" is read-only.`);
     if (el.tagName === "INPUT") {
@@ -506,9 +745,20 @@
     throw new Error(`Element "${ref}" is not editable.`);
   }
 
+  function isPassword(el) {
+    return el.tagName === "INPUT" && (el.type === "password" || el.autocomplete === "current-password" || el.autocomplete === "new-password");
+  }
+
+  /** Refuses elements agents must not read or change through evaluate. */
+  function guardSecret(ref) {
+    if (isPassword(element(ref))) throw new Error(`Element "${ref}" is a password field; agents do not read or change passwords.`);
+    return true;
+  }
+
   /** Sets a value the way frameworks (React, Vue) observe it: native setter + input/change events. */
   function setValue(ref, value) {
     const el = element(ref);
+    if (isPassword(el)) throw new Error(`Element "${ref}" is a password field; let the user enter it.`);
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -592,6 +842,14 @@
     element(ref).scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
   }
 
+  /** The address of the file an element shows or links to (image, link, embed, video). */
+  function resourceOf(ref) {
+    const el = element(ref);
+    const url = el.currentSrc || el.src || el.href || el.data || el.getAttribute("src") || el.getAttribute("href");
+    if (!url) throw new Error(`Element "${ref}" does not show or link to a file.`);
+    return new URL(url, el.ownerDocument.baseURI).href;
+  }
+
   function viewport() {
     return { width: window.innerWidth, height: window.innerHeight };
   }
@@ -600,17 +858,305 @@
   // The waiting itself happens in the extension, whose timers are not
   // throttled like a background tab's.
   let mutationCount = 0;
+  let lastMutation = 0;
   new MutationObserver((records) => {
     mutationCount += records.length;
+    lastMutation = Date.now();
   }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
 
   function mutations() {
     return mutationCount;
   }
 
+  /** Milliseconds since the DOM last changed (Infinity if it never did). */
+  function quietFor() {
+    return lastMutation ? Date.now() - lastMutation : Infinity;
+  }
+
+  // --- Readable text -----------------------------------------------------------
+
+  const BLOCK_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "CENTER", "DD", "DETAILS", "DIALOG", "DIV", "DL", "DT",
+    "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER", "FORM", "HEADER", "HGROUP", "LI", "MAIN", "NAV", "OL",
+    "P", "SECTION", "SUMMARY", "UL", "BODY", "FRAMESET",
+  ]);
+
+  /**
+   * The text a person reads on the page (or in one element), as light
+   * Markdown: headings, paragraphs, lists, tables, code and links. Nothing is
+   * clipped; the server pages through it. Form values are left out.
+   */
+  function readText({ ref, selector, links = true } = {}) {
+    let root;
+    if (ref) root = element(ref);
+    else if (selector) {
+      root = document.querySelector(selector);
+      if (!root) throw new Error(`Nothing on the page matches the selector ${JSON.stringify(selector)}.`);
+    } else root = document.body || document.documentElement;
+    const blocks = [];
+    let line = "";
+    const flush = () => {
+      const text = line.replace(/[ \t\u00a0]+/g, " ").trim();
+      if (text) blocks.push(text);
+      line = "";
+    };
+    const block = (text) => {
+      flush();
+      if (text) blocks.push(text);
+    };
+    const visibleText = (el) => collapse(el.innerText ?? el.textContent);
+
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        line += node.textContent.replace(/\s+/g, " ");
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node;
+      const tag = el.tagName;
+      if (SKIPPED_TAGS.has(tag) || isHidden(el)) return;
+      if (tag === "BR") return flush();
+      if (tag === "HR") return block("---");
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "OPTION") return;
+      if (tag === "IMG") {
+        if (el.alt) line += ` [image: ${collapse(el.alt)}] `;
+        return;
+      }
+      if (tag === "IFRAME" || tag === "FRAME") {
+        if (frameDocument(el)) childNodesOf(el).forEach(walk);
+        else block(`[[bmcp-frame:${frameTokens.get(el) ?? "?"}]]`);
+        return;
+      }
+      if (/^H[1-6]$/.test(tag)) return block(`${"#".repeat(Number(tag[1]))} ${visibleText(el)}`);
+      if (tag === "PRE") return block("```\n" + (el.innerText ?? el.textContent).replace(/\n+$/, "") + "\n```");
+      if (tag === "TABLE") return block(tableText(el));
+      if (tag === "A" && links) {
+        const href = el.getAttribute("href");
+        const text = visibleText(el);
+        if (href && text && !href.startsWith("javascript:")) {
+          line += ` [${text}](${shortUrl(href, el.ownerDocument.baseURI)}) `;
+          return;
+        }
+      }
+      if (tag === "LI") {
+        flush();
+        const start = blocks.length;
+        childNodesOf(el).forEach(walk);
+        flush();
+        if (blocks.length > start) blocks[start] = `- ${blocks[start]}`;
+        return;
+      }
+      const isBlock = BLOCK_TAGS.has(tag) || tag === "TR";
+      if (isBlock) flush();
+      childNodesOf(el).forEach(walk);
+      if (isBlock) flush();
+    };
+
+    walk(root);
+    flush();
+    return { text: blocks.join("\n"), url: location.href, title: document.title };
+  }
+
+  function tableText(table) {
+    const rows = [...table.rows].filter((row) => !isHidden(row));
+    if (!rows.length) return collapse(table.innerText);
+    const cells = (row) => [...row.cells].map((cell) => collapse(cell.innerText).replace(/\|/g, "\\|"));
+    const lines = rows.map((row) => `| ${cells(row).join(" | ")} |`);
+    if ([...rows[0].cells].every((cell) => cell.tagName === "TH")) {
+      lines.splice(1, 0, `|${" --- |".repeat(rows[0].cells.length)}`);
+    }
+    const caption = table.caption ? `${collapse(table.caption.innerText)}\n` : "";
+    return caption + lines.join("\n");
+  }
+
+  function frameText(options) {
+    if (SAME_ORIGIN_PARENT) return { token: TOKEN, inlined: true };
+    return { token: TOKEN, ...readText(options) };
+  }
+
+  // --- "An agent is working here" overlay -------------------------------------
+
+  const WORDS = {
+    tr: {
+      reading: "okuyor", typing: "yazıyor", clicking: "tıklıyor", opening: "sayfayı açıyor", scrolling: "kaydırıyor",
+      looking: "bakıyor", uploading: "dosya yüklüyor", running: "çalışıyor", handoff: "Sende",
+    },
+    en: {
+      reading: "reading", typing: "typing", clicking: "clicking", opening: "opening the page", scrolling: "scrolling",
+      looking: "looking", uploading: "uploading a file", running: "working", handoff: "Your turn",
+    },
+  };
+  const LANG = (navigator.language || "en").toLowerCase().startsWith("tr") ? "tr" : "en";
+  const OVERLAY_CSS = `
+    :host { all: initial; }
+    .glow, .label { opacity: 0; transition: opacity .45s ease; }
+    .on .glow, .on .label { opacity: 1; }
+    .glow {
+      position: fixed; inset: 0; pointer-events: none;
+      box-shadow: inset 0 0 0 1px rgba(10, 132, 255, .45), inset 0 0 22px rgba(10, 132, 255, .22), inset 0 0 64px rgba(10, 132, 255, .10);
+    }
+    .handoff .glow { display: none; }
+    .label {
+      position: fixed; right: 14px; bottom: 14px; max-width: min(320px, calc(100vw - 28px));
+      display: flex; align-items: center; gap: 7px; padding: 6px 12px 6px 10px; box-sizing: border-box;
+      font: 500 12px/16px -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      letter-spacing: .01em; color: #f5f5f7; background: rgba(29, 29, 31, .74);
+      -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+      border: .5px solid rgba(255, 255, 255, .16); border-radius: 999px; box-shadow: 0 6px 20px rgba(0, 0, 0, .18);
+    }
+    .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #0a84ff; box-shadow: 0 0 6px rgba(10, 132, 255, .7); }
+    .handoff .dot { background: #ff9f0a; box-shadow: 0 0 6px rgba(255, 159, 10, .7); }
+    @media (prefers-reduced-motion: reduce) { .glow, .label { transition: none; } }
+  `;
+  let overlay = null;
+
+  function ensureOverlay() {
+    if (!IS_TOP) return null;
+    if (overlay?.host.isConnected) return overlay;
+    const host = document.createElement("div");
+    // Fixed and out of the flow: no layout change, no clicks taken.
+    host.style.cssText =
+      "all: initial !important; position: fixed !important; inset: 0 !important; pointer-events: none !important; z-index: 2147483647 !important; contain: strict !important;";
+    const root = host.attachShadow({ mode: "closed" });
+    try {
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync(OVERLAY_CSS);
+      root.adoptedStyleSheets = [sheet];
+    } catch {
+      const style = document.createElement("style");
+      style.textContent = OVERLAY_CSS;
+      root.append(style);
+    }
+    const box = document.createElement("div");
+    const glow = document.createElement("div");
+    glow.className = "glow";
+    const label = document.createElement("div");
+    label.className = "label";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const text = document.createElement("span");
+    text.className = "text";
+    label.append(dot, text);
+    box.append(glow, label);
+    root.append(box);
+    (document.documentElement || document).appendChild(host);
+    overlay = { host, box, text, timer: null, handoff: false };
+    return overlay;
+  }
+
+  /** Shows that `agent` is working here and what it is doing; fades out when it stops. */
+  function activity(agent, kind) {
+    const o = ensureOverlay();
+    if (!o || o.handoff) return false;
+    o.text.textContent = `${agent} · ${WORDS[LANG][kind] ?? kind}`;
+    o.box.className = "on";
+    clearTimeout(o.timer);
+    o.timer = setTimeout(() => (o.box.className = ""), 2_500);
+    return true;
+  }
+
+  /**
+   * The agent left this tab to the user with a note. The label stays until
+   * the user acts on the page; with `blink`, the tab's title and icon also
+   * alternate with the note (about once a second) until the background
+   * tells it the user is looking (handoffQuiet).
+   */
+  function handoffNotice(agent, note, blink = false) {
+    const o = ensureOverlay();
+    if (!o) return false;
+    clearTimeout(o.timer);
+    o.handoff = true;
+    o.text.textContent = `${WORDS[LANG].handoff}: ${note}${agent ? ` — ${agent}` : ""}`;
+    o.box.className = "on handoff";
+    const shownAt = Date.now();
+    const done = (event) => {
+      if (!event.isTrusted || Date.now() - shownAt < 1_000) return;
+      removeEventListener("pointerdown", done, true);
+      removeEventListener("keydown", done, true);
+      handoffClear();
+      chrome.runtime.sendMessage({ cmd: "handoffSeen" }).catch(() => {});
+    };
+    o.dismiss = () => {
+      removeEventListener("pointerdown", done, true);
+      removeEventListener("keydown", done, true);
+    };
+    addEventListener("pointerdown", done, true);
+    addEventListener("keydown", done, true);
+    if (blink) startBlink(`🔑 ${WORDS[LANG].handoff}: ${note}`);
+    return true;
+  }
+
+  /** The user is looking at the tab: the title stops alternating, the label stays. */
+  function handoffQuiet() {
+    stopBlink();
+    return true;
+  }
+
+  /** The handover is over (seen and acted on, kept, or taken back by the agent). */
+  function handoffClear() {
+    stopBlink();
+    if (!overlay) return true;
+    overlay.dismiss?.();
+    overlay.handoff = false;
+    overlay.box.className = "";
+    return true;
+  }
+
+  // Title and icon alternation for a tab that waits for the user.
+  const MARK_ICON =
+    "data:image/svg+xml," +
+    encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="#ff9f0a"/><circle cx="16" cy="16" r="5" fill="#fff"/></svg>');
+  let blinker = null;
+
+  function startBlink(marker) {
+    stopBlink();
+    const state = { marker, pageTitle: document.title, on: false, icon: null };
+    // The page may retitle itself meanwhile (a new message count, a step):
+    // remember its latest title so it comes back intact.
+    state.watch = new MutationObserver(() => {
+      const title = document.title;
+      if (title !== state.marker && title !== state.pageTitle) state.pageTitle = title;
+    });
+    state.watch.observe(document.head || document.documentElement, { subtree: true, childList: true, characterData: true });
+    const flip = () => {
+      state.on = !state.on;
+      document.title = state.on ? state.marker : state.pageTitle;
+      if (state.on) {
+        state.icon = document.createElement("link");
+        state.icon.rel = "icon";
+        state.icon.href = MARK_ICON;
+        (document.head || document.documentElement).appendChild(state.icon);
+      } else {
+        state.icon?.remove();
+        state.icon = null;
+      }
+    };
+    flip();
+    state.timer = setInterval(flip, 1_000);
+    blinker = state;
+  }
+
+  function stopBlink() {
+    if (!blinker) return;
+    const state = blinker;
+    blinker = null;
+    clearInterval(state.timer);
+    state.watch.disconnect();
+    state.icon?.remove();
+    if (document.title === state.marker) document.title = state.pageTitle;
+  }
+
+  /** Keeps the overlay out of screenshots. */
+  function overlayHidden(hidden) {
+    if (overlay) overlay.host.style.setProperty("display", hidden ? "none" : "block", "important");
+    return true;
+  }
+
   globalThis.__bmcp = {
-    snapshot, element, check, prepareTarget, center: centerOf, blocker, dragPoints, editKind, setValue,
+    snapshot, frameSnapshot, element, check, prepareTarget, center: centerOf, blocker, dragPoints, editKind, setValue,
     selectContent, fieldValue, isChecked, isNativeSelect, selectOptions, isFileInput, scrollIntoView, viewport,
-    mutations,
+    mutations, quietFor, changes, setPrefix, probe, frameOffset, frameBlocker, info, boxIn, readText, frameText, resourceOf, guardSecret,
+    activity, handoffNotice, handoffQuiet, handoffClear, overlayHidden,
   };
 })();

@@ -1,24 +1,68 @@
 import { z } from "zod";
 
-import { findInSnapshot, formatSnapshot, readPageSnapshot, snapshotResult, snapshotSubtree } from "../snapshot";
+import { findInSnapshot, formatSnapshot, pageOf, readPageSnapshot, snapshotSubtree } from "../snapshot";
 import { defineTool, READ_ONLY, text } from "./tool";
 
 export const snapshot = defineTool({
   name: "browser_snapshot",
   description:
-    "Capture accessibility snapshot of the current page. Use this for getting references to elements to interact with. Pass a ref to see only that part of the page.",
+    "Capture the accessibility snapshot of the current page, frames from other sites included. Use it to get refs for elements to interact with. Pass a ref to see only that part, or an offset to continue a long snapshot. To read long text (an email, an article), browser_get_text is better.",
   inputSchema: z.object({
     ref: z.string().min(1).optional().describe("Only return the subtree of this element"),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Continue a truncated snapshot from this character (given at its end)"),
   }),
   annotations: READ_ONLY,
-  handle: async (context, { ref }) => {
-    if (!ref) return snapshotResult(context);
+  handle: async (context, { ref, offset }) => {
     const page = await readPageSnapshot(context);
+    if (!ref) return text(formatSnapshot(page, { maxChars: context.snapshotMaxChars, offset }));
     const subtree = snapshotSubtree(page.snapshot, ref);
     if (subtree === undefined) {
       throw new Error(`Element "${ref}" is not on the current page. Take a full snapshot first.`);
     }
-    return text(formatSnapshot({ ...page, snapshot: subtree }, { maxChars: context.snapshotMaxChars }));
+    return text(formatSnapshot({ ...page, snapshot: subtree }, { maxChars: context.snapshotMaxChars, offset }));
+  },
+});
+
+const DEFAULT_TEXT_CHARS = 30_000;
+
+export const getText = defineTool({
+  name: "browser_get_text",
+  description:
+    "Read the page's text the way a person reads it — headings, paragraphs, lists, tables, links — in full (nothing clipped), frames from other sites included. Pass a ref (e.g. an email body or article from the snapshot) or a CSS selector to read only that part. Long text comes in pages: continue with the offset given at the end.",
+  inputSchema: z.object({
+    ref: z.string().min(1).optional().describe("Read only this element (a ref from the snapshot)"),
+    selector: z.string().min(1).optional().describe("Read only the first element matching this CSS selector"),
+    offset: z.number().int().min(0).optional().describe("Continue from this character (given at the end of a page)"),
+    maxChars: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(200_000)
+      .optional()
+      .describe(`Characters per page (default ${DEFAULT_TEXT_CHARS})`),
+    links: z.boolean().optional().describe("Include link addresses as [text](url) (default true)"),
+  }),
+  annotations: READ_ONLY,
+  handle: async (context, { ref, selector, offset = 0, maxChars = DEFAULT_TEXT_CHARS, links }) => {
+    const result = await context.send("browser_get_text", { ref, selector, links });
+    const total = result.text.length;
+    const body = pageOf(
+      result.text,
+      maxChars,
+      offset,
+      (next, left) => `[… ${left} more characters: call browser_get_text with offset: ${next}${ref ? ` and ref: "${ref}"` : ""}${selector ? " and the same selector" : ""} to continue]`,
+    );
+    const scope = ref ? ` of ${ref}` : selector ? ` of ${selector}` : "";
+    return text(
+      [`- Page URL: ${result.url}`, `- Page Title: ${result.title}`, `- Text${scope} (${total} characters):`, "", body || "(no text)"].join(
+        "\n",
+      ),
+    );
   },
 });
 
@@ -31,10 +75,18 @@ export const find = defineTool({
   }),
   annotations: READ_ONLY,
   handle: async (context, args) => {
-    const page = await readPageSnapshot(context);
+    // The extension gives a page that is still loading a moment to show the text.
+    const page = await readPageSnapshot(context, args.text);
     const { text: found, matches } = findInSnapshot(page.snapshot, args.text);
     const header = [`- Page URL: ${page.url}`, `- Page Title: ${page.title}`];
-    if (!matches) return text([...header, `No elements match ${JSON.stringify(args.text)}.`].join("\n"));
+    if (!matches) {
+      return text(
+        [
+          ...header,
+          `No elements match ${JSON.stringify(args.text)}. If the page is still loading content, browser_wait_for waits for text to appear; browser_get_text searches the full text.`,
+        ].join("\n"),
+      );
+    }
     const shown = matches > 30 ? ` (showing the first 30 of ${matches})` : "";
     return text(
       [...header, `- ${matches} match${matches === 1 ? "" : "es"}${shown}`, "```yaml", found, "```"].join("\n"),
@@ -44,28 +96,42 @@ export const find = defineTool({
 
 export const screenshot = defineTool({
   name: "browser_screenshot",
-  description: "Take a screenshot of the visible part of the current page",
-  inputSchema: z.object({}),
+  description:
+    "Take a screenshot of the visible part of the page, of one element (ref), or of the whole page (fullPage)",
+  inputSchema: z.object({
+    element: z.string().optional().describe("Human-readable description of the element"),
+    ref: z.string().min(1).optional().describe("Only this element (a ref from the snapshot)"),
+    fullPage: z.boolean().optional().describe("The whole page, not just what is visible"),
+  }),
   annotations: READ_ONLY,
-  handle: async (context) => {
-    const data = await context.send("browser_screenshot", {});
+  handle: async (context, { ref, fullPage }) => {
+    const data = await context.send("browser_screenshot", ref || fullPage ? { ref, fullPage } : {});
     return { content: [{ type: "image", data, mimeType: "image/png" }] };
   },
 });
 
 export const getConsoleLogs = defineTool({
   name: "browser_get_console_logs",
-  description: "Get the console logs from the browser",
+  description:
+    "Get the page's console messages (logs, warnings, errors, uncaught exceptions) and its failed network requests (HTTP 4xx/5xx, network errors) since it loaded",
   inputSchema: z.object({}),
   annotations: READ_ONLY,
   handle: async (context) => {
     const logs = await context.send("browser_get_console_logs", {});
     if (!Array.isArray(logs) || logs.length === 0) {
-      return text("No console logs captured.");
+      return text("No console messages or failed requests.");
     }
-    return text(logs.map((entry) => JSON.stringify(entry)).join("\n"));
+    return text(logs.map(formatConsoleEntry).join("\n"));
   },
 });
+
+export function formatConsoleEntry(entry: unknown): string {
+  if (entry && typeof entry === "object" && typeof (entry as { message?: unknown }).message === "string") {
+    const { type, message } = entry as { type?: string; message: string };
+    return `[${type ?? "log"}] ${message}`;
+  }
+  return JSON.stringify(entry);
+}
 
 const MAX_WAIT_SECONDS = 300;
 

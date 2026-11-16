@@ -81,7 +81,15 @@ function render(status) {
   const here = status.activeConnected;
   const agentTab = status.activeAgentTab;
   const toggle = $("toggle");
-  if (agentTab) {
+  if (status.activeHandoff) {
+    // An agent left this tab to the user.
+    $("currentText").textContent = `${status.activeHandoff.agent} is waiting for you: ${status.activeHandoff.note}`;
+    toggle.textContent = "Done";
+    toggle.className = "primary";
+    toggle.disabled = false;
+    toggle.title = "Clear the note; the tab stays open and stays yours.";
+    toggle.onclick = () => run(() => call("dismissHandoff", { tabId: status.activeTabId }));
+  } else if (agentTab) {
     // Opened for an agent: it closes when the agent is done, unless the user keeps it.
     $("currentText").textContent = `${agentTab.agent ? `Opened by ${agentTab.agent}` : "Opened by an agent"} — closes when it is done`;
     toggle.textContent = "Keep this tab";
@@ -101,6 +109,19 @@ function render(status) {
     toggle.title = here ? "" : "Let agents work in this tab too";
     toggle.onclick = () => run(() => call(here ? "disconnect" : "connect", { tabId: status.activeTabId }));
   }
+
+  // Tabs agents left to the user
+  $("waitingSection").hidden = status.handoffs.length === 0;
+  $("waiting").replaceChildren(
+    ...status.handoffs.map((h) =>
+      el(
+        "button",
+        { class: "plate agent", "--agent": "#ff9f0a", title: "Show this tab", onclick: () => run(() => call("focusTab", { tabId: h.tabId })) },
+        el("div", { class: "top" }, el("span", { class: "name ellipsis", textContent: h.note }), el("span", { class: "chip", textContent: h.agent })),
+        el("div", { class: "line small muted" }, el("span", { class: "ellipsis", textContent: `▸ ${h.title}` })),
+      ),
+    ),
+  );
 
   // Agents
   $("agentHeading").textContent = status.agents.length ? `· ${status.agents.length}` : "";

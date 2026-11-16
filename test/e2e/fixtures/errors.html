@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+  <head><title>Errors</title></head>
+  <body>
+    <p>Errors happen here.</p>
+    <script>
+      setTimeout(() => {
+        console.error("boom error", { code: 7 });
+        fetch("/missing.json").catch(() => {});
+        setTimeout(() => {
+          throw new Error("uncaught kaboom");
+        }, 10);
+      }, 150);
+    </script>
+  </body>
+</html>
