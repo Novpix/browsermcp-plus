@@ -35,13 +35,15 @@ export function defaultUserDataDir(
   env: NodeJS.ProcessEnv = process.env,
   home = os.homedir(),
 ): string {
+  // The platform's own separators, whatever system this runs on.
+  const { join } = platform === "win32" ? path.win32 : path.posix;
   switch (platform) {
     case "darwin":
-      return path.join(home, "Library", "Application Support", "Google", "Chrome");
+      return join(home, "Library", "Application Support", "Google", "Chrome");
     case "win32":
-      return path.join(env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Google", "Chrome", "User Data");
+      return join(env.LOCALAPPDATA || join(home, "AppData", "Local"), "Google", "Chrome", "User Data");
     default:
-      return path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "google-chrome");
+      return join(env.XDG_CONFIG_HOME || join(home, ".config"), "google-chrome");
   }
 }
 
