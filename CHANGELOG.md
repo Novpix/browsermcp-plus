@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A page that retitled itself while a handed-over tab showed its note cut
+  that blink short, so the note could stay away for two seconds. The note now
+  stays for its whole blink; the page's new title comes back with the next.
+- Chrome profile paths are built with the platform's own separators, so the
+  tests pass on Windows too.
+
 ## 0.7.2
 
 Agents work in the background: the tab you are looking at stays in front.

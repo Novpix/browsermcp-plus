@@ -498,7 +498,7 @@ describe("tabs, the AI group and handing a tab to the user", () => {
     await page.bringToFront();
     await worker.evaluate((id) => chrome.tabs.update(id, { active: true }), waitingTab);
     const looking = new Set<string>();
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 25; i++) {
       looking.add(await page.title());
       await new Promise((r) => setTimeout(r, 100));
     }

@@ -1130,14 +1130,22 @@
     stopBlink();
     const state = { marker, pageTitle: document.title, on: false, icon: null };
     // The page may retitle itself meanwhile (a new message count, a step):
-    // remember its latest title so it comes back intact.
+    // remember its latest title so it comes back intact. While the note
+    // shows, it stays: the page's title comes back with the next blink (once
+    // a blink, so a page that insists on its title does not fight us).
     state.watch = new MutationObserver(() => {
       const title = document.title;
-      if (title !== state.marker && title !== state.pageTitle) state.pageTitle = title;
+      if (title === state.marker) return;
+      state.pageTitle = title;
+      if (state.on && !state.kept) {
+        state.kept = true;
+        document.title = state.marker;
+      }
     });
     state.watch.observe(document.head || document.documentElement, { subtree: true, childList: true, characterData: true });
     const flip = () => {
       state.on = !state.on;
+      state.kept = false;
       document.title = state.on ? state.marker : state.pageTitle;
       if (state.on) {
         state.icon = document.createElement("link");
