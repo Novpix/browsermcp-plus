@@ -1051,10 +1051,40 @@
   // Real user input (not the page's own synthetic events) goes to the
   // background, which tells it from the agent's input by time: a click or key
   // in an agent's tab pauses the agent there; in a handed-over tab it ends
-  // the handover. Looking, scrolling and moving the mouse are not input here.
+  // the handover. Looking, scrolling and moving the mouse are not input here,
+  // and neither are a modifier alone or a shortcut (Cmd+Tab out of Chrome
+  // begins with a keydown of Meta in the page the user leaves; Cmd+C copies),
+  // keys that scroll the page itself, a press on a scrollbar, a right click,
+  // or anything in a tab the user cannot see. On a focused control the same
+  // keys act (Space presses a button, arrows change a select), so they count.
+  const MODIFIERS = new Set(["Shift", "Control", "Alt", "AltGraph", "Meta", "OS", "Fn", "FnLock", "Hyper", "Super", "CapsLock", "NumLock", "ScrollLock", "Dead", "Unidentified"]);
+  const SCROLL_KEYS = new Set([" ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"]);
+  const editable = (el) => el instanceof Element && (el.isContentEditable || el.matches("input, textarea, select"));
+  const onPage = (el) => !(el instanceof Element) || el === document.documentElement || el === document.body;
+  const stepsIn = (event) => {
+    if (document.visibilityState !== "visible") return false;
+    const target = event.composedPath?.()[0] ?? event.target;
+    if (event.type === "keydown") {
+      const key = event.key ?? "";
+      if (MODIFIERS.has(key) || /^F\d{1,2}$/.test(key)) return false;
+      // Shortcuts (switch window or tab, copy, find, zoom…) leave the page as it is; paste, cut and undo in a field do not.
+      if ((event.metaKey || event.ctrlKey) && !(editable(target) && /^[vxz]$/i.test(key))) return false;
+      return !(SCROLL_KEYS.has(key) && onPage(target));
+    }
+    if (event.button !== 0) return false;
+    const root = document.documentElement;
+    if (root && (event.clientX >= root.clientWidth || event.clientY >= root.clientHeight)) return false;
+    if (target instanceof Element && target !== root && target !== document.body) {
+      const box = target.getBoundingClientRect();
+      const x = event.clientX - box.left - target.clientLeft;
+      const y = event.clientY - box.top - target.clientTop;
+      if ((target.clientWidth && x > target.clientWidth) || (target.clientHeight && y > target.clientHeight)) return false;
+    }
+    return true;
+  };
   let lastInputReport = 0;
   const reportInput = (event) => {
-    if (!event.isTrusted) return;
+    if (!event.isTrusted || !stepsIn(event)) return;
     const now = Date.now();
     if (now - lastInputReport < 250) return;
     lastInputReport = now;

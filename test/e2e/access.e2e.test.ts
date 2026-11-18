@@ -546,8 +546,8 @@ describe("tabs, the AI group and handing a tab to the user", () => {
       await new Promise((r) => setTimeout(r, 100));
     }
     expect([...titles].some((t) => t.startsWith("🔑 ")), [...titles].join(" | ")).toBe(true);
-    // A key pressed in the page ends it too.
-    await page.keyboard.press("Shift");
+    // A key pressed in the page ends it too (a modifier alone does not: that is switching apps or a shortcut).
+    await page.keyboard.press("a");
     await waitFor(async () => (await bmcp<{ handoffs: unknown[] }>("status")).handoffs.length === 0);
   });
 
@@ -604,6 +604,23 @@ describe("tabs, the AI group and handing a tab to the user", () => {
       await new Promise((r) => setTimeout(r, 700));
       const click = await call("alpha", "browser_click", { element: "Click me", ref: ref(snap, /button "Click me"/) });
       expect(click.isError, click.text).toBeFalsy();
+      expect(await counter()).toBe("Clicked 2x");
+    });
+
+    it("does not count switching apps, shortcuts or scroll keys on the page as the user", async () => {
+      // Nothing focused: the keys go to the page itself (on a focused button Space would press it, and that counts).
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+      await new Promise((r) => setTimeout(r, 700));
+      // Cmd+Tab out of Chrome begins with Meta; Cmd+C; arrows, Page Down, Shift and Space on the page.
+      await page.keyboard.down("Meta");
+      await page.keyboard.press("c");
+      await page.keyboard.up("Meta");
+      for (const key of ["ArrowDown", "PageDown", "Shift", "Space"]) {
+        await page.keyboard.press(key);
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      const snapshot = await call("alpha", "browser_snapshot");
+      expect(snapshot.isError, snapshot.text).toBeFalsy();
       expect(await counter()).toBe("Clicked 2x");
     });
 
